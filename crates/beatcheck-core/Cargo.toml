@@ -1,0 +1,17 @@
+[package]
+name = "beatcheck-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+rustfft.workspace = true
+symphonia.workspace = true
+tract-onnx = { workspace = true, optional = true }
+
+[features]
+default = ["neural-onnx"]
+neural-onnx = ["dep:tract-onnx"]

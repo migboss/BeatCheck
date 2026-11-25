@@ -1,0 +1,89 @@
+name: Build BeatCheck (Windows & macOS)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+
+permissions:
+  contents: read
+
+jobs:
+  build-macos:
+    name: macOS Universal (.app)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust (Apple Silicon + Intel targets)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Build Universal BeatCheck.app
+        run: |
+          chmod +x packaging/macos/bundle_macos.sh
+          ./packaging/macos/bundle_macos.sh
+
+      - name: Package BeatCheck-macOS-Universal.zip
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent dist/BeatCheck.app BeatCheck-macOS-Universal.zip
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BeatCheck-macOS-Universal
+          path: BeatCheck-macOS-Universal.zip
+
+  build-windows:
+    name: Windows x64 (.exe)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Build portable BeatCheck.exe
+        run: cargo build --release -p beatcheck-app
+
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BeatCheck-Windows-x64
+          path: target/release/BeatCheck.exe
+
+  release:
+    name: Create GitHub Release
+    needs: [ build-macos, build-windows ]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Publish Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/BeatCheck-macOS-Universal/BeatCheck-macOS-Universal.zip
+            release-assets/BeatCheck-Windows-x64/BeatCheck.exe

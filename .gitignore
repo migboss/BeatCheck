@@ -1,0 +1,6 @@
+/target/
+/dist/
+beatcheck.toml
+*.log
+.DS_Store
+Thumbs.db

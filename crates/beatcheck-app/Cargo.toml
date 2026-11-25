@@ -1,0 +1,20 @@
+[package]
+name = "beatcheck-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "BeatCheck"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+toml.workspace = true
+eframe.workspace = true
+egui.workspace = true
+rfd.workspace = true
+beatcheck-core = { path = "../beatcheck-core" }
+beatcheck-edl = { path = "../beatcheck-edl" }
+beatcheck-audio = { path = "../beatcheck-audio" }

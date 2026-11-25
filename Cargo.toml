@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/beatcheck-core",
+    "crates/beatcheck-edl",
+    "crates/beatcheck-audio",
+    "crates/beatcheck-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["BeatCheck"]
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+rustfft = "6.2"
+symphonia = { version = "0.5", features = ["mp3", "wav", "flac", "ogg", "vorbis", "aac", "isomp4", "pcm"] }
+cpal = "0.15"
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+egui = "0.31"
+rfd = "0.15"
+tract-onnx = "0.21"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+panic = "abort"
