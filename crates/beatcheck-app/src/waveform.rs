@@ -533,13 +533,20 @@ pub fn draw_main_waveform(
         Stroke::new(1.0, brand::BORDER),
     );
 
-    // Subtle alternating musical bar shading
+    // Subtle alternating musical bar shading (anchored to quantized exported Downbeat frames!)
     let view_end_sec = wf.view_start_sec + view_span_sec;
     let downbeats: Vec<(u32, f64)> = track
         .marks
         .iter()
         .filter(|m| m.kind == MarkKind::Downbeat)
-        .map(|m| (m.bar, m.time_sec))
+        .map(|m| {
+            (
+                m.bar,
+                export
+                    .quantized_mark_time_sec(m.time_sec, track.in_point_sec)
+                    .clamp(0.0, dur),
+            )
+        })
         .collect();
     for pair in downbeats.windows(2) {
         let (bar, t0) = pair[0];
@@ -586,7 +593,7 @@ pub fn draw_main_waveform(
             .frame_rate
             .seconds_to_frames(view_end_sec - grid_origin_sec)
             + 1;
-        let grid_alpha = ((frame_px - 12.0) * 1.4).clamp(10.0, 26.0) as u8;
+        let grid_alpha = ((frame_px - 12.0) * 1.5).clamp(12.0, 34.0) as u8;
         let grid_col = Color32::from_rgba_unmultiplied(255, 255, 255, grid_alpha);
         for f in first_f..=last_f {
             let t = grid_origin_sec + export.frame_rate.frames_to_seconds(f);
