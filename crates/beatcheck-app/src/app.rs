@@ -287,7 +287,11 @@ impl BeatCheckApp {
                     snapped_t,
                 );
                 self.status_message = Some((
-                    format!("Moved selected mark {:+}f -> {tc}  (Ctrl+Z to undo)", frames),
+                    format!(
+                        "Moved selected mark {:+}f -> {tc}  ({}+Z to undo)",
+                        frames,
+                        brand::MOD_KEY
+                    ),
                     false,
                 ));
             }
@@ -315,7 +319,11 @@ impl BeatCheckApp {
         if let Some(tc) = added_tc {
             self.sync_audio_clicks();
             self.status_message = Some((
-                format!("Added {} at {tc}  (Ctrl+Z to undo)", kind.short_name()),
+                format!(
+                    "Added {} at {tc}  ({}+Z to undo)",
+                    kind.short_name(),
+                    brand::MOD_KEY
+                ),
                 false,
             ));
         }
@@ -339,7 +347,10 @@ impl BeatCheckApp {
         }
         if deleted {
             self.sync_audio_clicks();
-            self.status_message = Some(("Deleted selected mark  (Ctrl+Z to undo)".into(), false));
+            self.status_message = Some((
+                format!("Deleted selected mark  ({}+Z to undo)", brand::MOD_KEY),
+                false,
+            ));
         }
     }
 
@@ -352,7 +363,10 @@ impl BeatCheckApp {
                 .set_loop_range(track.in_point_sec, track.out_point_sec);
             self.sync_audio_clicks();
             self.status_message = Some((
-                "Reset all edits to original algorithm marks  (Ctrl+Z to undo)".into(),
+                format!(
+                    "Reset all edits to original algorithm marks  ({}+Z to undo)",
+                    brand::MOD_KEY
+                ),
                 false,
             ));
         }
@@ -423,7 +437,7 @@ impl BeatCheckApp {
         if key_esc {
             self.wf_state.selected_mark_id = None;
         }
-        if self.track.is_none() {
+        if self.track.is_none() || self.worker_rx.is_some() {
             return;
         }
         if let Some(kind) = add_key {
@@ -868,12 +882,20 @@ impl eframe::App for BeatCheckApp {
         if let Some(snap) = wf_actions.undo_snapshot {
             self.history.push_snapshot(&snap);
         }
+        if let Some(kind) = wf_actions.enable_mark_kind {
+            self.export.style.style_for_mut(kind).enabled = true;
+            need_audio_sync = true;
+        }
         if let Some(track) = self.track.as_mut() {
             if let Some(mult) = hud_actions.bpm_multiplier {
-                self.history.push_snapshot(track);
-                editing::toggle_bpm_multiplier(track, mult);
-                self.wf_state.selected_mark_id = None;
-                wf_actions.marks_mutated = true;
+                let candidate = track.detected_bpm * (track.bpm_multiplier * mult);
+                if (35.0..=260.0).contains(&candidate) {
+                    self.history.push_snapshot(track);
+                    if editing::toggle_bpm_multiplier(track, mult) {
+                        self.wf_state.selected_mark_id = None;
+                        wf_actions.marks_mutated = true;
+                    }
+                }
             }
             if let Some(delta) = hud_actions.shift_downbeat {
                 self.history.push_snapshot(track);
@@ -918,13 +940,16 @@ impl eframe::App for BeatCheckApp {
                 wf_actions.marks_mutated = true;
             }
             if let Some(z) = hud_actions.zoom_factor {
+                let min_pps = (self.main_view_width_px / track.duration_sec.max(1.0) as f32)
+                    .min(15.0)
+                    .max(0.5);
                 self.wf_state.pixels_per_sec =
-                    (self.wf_state.pixels_per_sec * z).clamp(15.0, 900.0);
+                    (self.wf_state.pixels_per_sec * z).clamp(min_pps, 900.0);
             }
             if hud_actions.zoom_fit {
                 self.wf_state.pixels_per_sec =
                     (self.main_view_width_px / track.duration_sec.max(1.0) as f32)
-                        .clamp(15.0, 900.0);
+                        .clamp(0.5, 900.0);
                 self.wf_state.view_start_sec = 0.0;
             }
             if wf_actions.marks_mutated {

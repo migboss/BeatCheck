@@ -773,7 +773,10 @@ fn draw_tune_grid_tab(
             false,
             30.0,
         )
-        .on_hover_text("Restore original detected marks & BPM (undoable with Ctrl+Z)")
+        .on_hover_text(format!(
+            "Restore original detected marks & BPM (undoable with {}+Z)",
+            brand::MOD_KEY
+        ))
         .clicked()
         {
             actions.reset_to_auto = true;

@@ -72,7 +72,7 @@ BeatCheck exports standard industry formats so you can drop beat markers into al
 | **DaVinci Resolve** | **Marker `.edl`** *(existing timeline)*<br>**`.fcpxml`** *(new timeline + audio)* | **`Timeline → Import → Timeline Markers from EDL...`**<br>or **`File → Import → Timeline...`** for `.fcpxml` |
 | **Final Cut Pro** | **`.fcpxml`** *(v1.9)* | **`File → Import → XML...`** — imports your audio clip and all beat markers already synced |
 | **Adobe Premiere Pro** | **Cut-List `.edl`** or **`.csv`** | **`File → Import...`** for beat-to-beat cut segments (`.edl`), or import `.csv` via your marker script/panel |
-| **Avid Media Composer** | **Cut-List `.edl`** / **Marker `.edl`** | Import standard CMX 3600 `.edl` via List Tool / EDL import |
+| **Avid Media Composer** | **Cut-List `.edl`** | Import standard CMX 3600 edit list via List Tool / EDL import |
 | **After Effects, REAPER & Custom Pipelines** | **`.csv`** or **`.json`** | Includes exact SMPTE timecodes, frame numbers, BPM, and bar/beat metadata |
 
 ---

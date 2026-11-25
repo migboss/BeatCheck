@@ -97,7 +97,7 @@ impl FrameRate {
         }
     }
 
-    /// FCPXML `frameDuration` attribute (e.g. `"100/2500s"` or `"1001/24000s"`).
+    /// FCPXML `frameDuration` attribute (e.g. `"1/25s"` or `"1001/24000s"`).
     pub fn fcpxml_frame_duration(&self) -> &'static str {
         match self {
             FrameRate::Fps23_976 => "1001/24000s",
@@ -108,6 +108,20 @@ impl FrameRate {
             FrameRate::Fps50 => "1/50s",
             FrameRate::Fps59_94Ndf | FrameRate::Fps59_94Df => "1001/60000s",
             FrameRate::Fps60 => "1/60s",
+        }
+    }
+
+    /// Valid FCPXML `<format name="...">` identifier matching `fcpxml_frame_duration()`.
+    pub fn fcpxml_format_name(&self) -> &'static str {
+        match self {
+            FrameRate::Fps23_976 => "FFVideoFormat1080p2398",
+            FrameRate::Fps24 => "FFVideoFormat1080p24",
+            FrameRate::Fps25 => "FFVideoFormat1080p25",
+            FrameRate::Fps29_97Ndf | FrameRate::Fps29_97Df => "FFVideoFormat1080p2997",
+            FrameRate::Fps30 => "FFVideoFormat1080p30",
+            FrameRate::Fps50 => "FFVideoFormat1080p50",
+            FrameRate::Fps59_94Ndf | FrameRate::Fps59_94Df => "FFVideoFormat1080p5994",
+            FrameRate::Fps60 => "FFVideoFormat1080p60",
         }
     }
 

@@ -97,7 +97,7 @@ pub fn draw_split_welcome_screen(
                                                 if brand::primary_cta_button(
                                                     ui,
                                                     Some(StrokeIcon::Folder),
-                                                    "Import Audio Track  (Ctrl+O)",
+                                                    &format!("Import Audio Track  ({}+O)", brand::MOD_KEY),
                                                     Vec2::new(236.0, 38.0),
                                                 )
                                                 .clicked()
@@ -146,7 +146,7 @@ pub fn draw_split_welcome_screen(
                                         ui,
                                         "01",
                                         "Timeline Marker .edl",
-                                        "Drop beat markers onto an existing timeline (DaVinci Resolve & Avid).",
+                                        "Drop color-coded beat markers straight onto an existing DaVinci Resolve timeline.",
                                     );
                                     ui.add_space(8.0);
                                     draw_guide_card(
@@ -160,7 +160,7 @@ pub fn draw_split_welcome_screen(
                                         ui,
                                         "03",
                                         "Cut-List .edl, CSV & JSON",
-                                        "Export beat-to-beat edits or timecodes for Premiere Pro, After Effects & more.",
+                                        "Export beat-to-beat edits or timecodes for Premiere Pro, Avid, After Effects & more.",
                                     );
                                 });
 
@@ -187,14 +187,15 @@ pub fn draw_split_welcome_screen(
                                         );
                                         ui.add_space(8.0);
                                         for path in existing_recents {
-                                            let name = path
+                                            let raw_name = path
                                                 .file_name()
                                                 .and_then(|s| s.to_str())
                                                 .unwrap_or("Audio Track");
+                                            let display_name = truncate_filename(raw_name, 30);
                                             if brand::stroke_button(
                                                 ui,
                                                 Some(StrokeIcon::Waveform),
-                                                name,
+                                                &display_name,
                                                 false,
                                                 30.0,
                                             )
@@ -223,6 +224,17 @@ pub fn draw_split_welcome_screen(
                 );
             });
         });
+}
+
+fn truncate_filename(name: &str, max_chars: usize) -> String {
+    let count = name.chars().count();
+    if count <= max_chars {
+        name.to_string()
+    } else {
+        let keep = max_chars.saturating_sub(1);
+        let prefix: String = name.chars().take(keep).collect();
+        format!("{prefix}…")
+    }
 }
 
 fn draw_guide_card(ui: &mut Ui, step: &str, title: &str, desc: &str) {

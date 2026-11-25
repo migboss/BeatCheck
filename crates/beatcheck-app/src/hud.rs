@@ -58,7 +58,10 @@ pub fn draw_top_hud(
 
         ui.add_space(2.0);
         if brand::stroke_button(ui, Some(StrokeIcon::Folder), "Open", false, 28.0)
-            .on_hover_text("Import MP3, WAV, FLAC, OGG, or M4A (Ctrl+O) — or drag & drop anywhere")
+            .on_hover_text(format!(
+                "Import MP3, WAV, FLAC, OGG, or M4A ({}+O) — or drag & drop anywhere",
+                brand::MOD_KEY
+            ))
             .clicked()
         {
             actions.open_file_dialog = true;
@@ -425,7 +428,7 @@ pub fn draw_waveform_toolbar(
         // 2. Undo / Redo / Reset to Algorithm
         ui.add_enabled_ui(can_undo, |ui| {
             if brand::stroke_button(ui, Some(StrokeIcon::Undo), "", false, 26.0)
-                .on_hover_text("Undo last edit (Ctrl+Z)")
+                .on_hover_text(format!("Undo last edit ({}+Z)", brand::MOD_KEY))
                 .clicked()
             {
                 actions.undo = true;
@@ -433,7 +436,7 @@ pub fn draw_waveform_toolbar(
         });
         ui.add_enabled_ui(can_redo, |ui| {
             if brand::stroke_button(ui, Some(StrokeIcon::Redo), "", false, 26.0)
-                .on_hover_text("Redo (Ctrl+Y)")
+                .on_hover_text(format!("Redo ({})", brand::REDO_SHORTCUT))
                 .clicked()
             {
                 actions.redo = true;
@@ -441,9 +444,10 @@ pub fn draw_waveform_toolbar(
         });
         ui.add_enabled_ui(can_reset, |ui| {
             if brand::stroke_button(ui, Some(StrokeIcon::Reset), "Reset", false, 26.0)
-                .on_hover_text(
-                    "Reset all manual changes back to what the algorithm originally marked (Ctrl+Z undoable)",
-                )
+                .on_hover_text(format!(
+                    "Reset all manual changes back to what the algorithm originally marked ({}+Z undoable)",
+                    brand::MOD_KEY
+                ))
                 .clicked()
             {
                 actions.reset_to_auto = true;
@@ -790,9 +794,12 @@ pub fn draw_transport_bar(
             );
         } else if has_track {
             ui.label(
-                RichText::new("Drag mark: ±1f snap  ·  1–4: Add mark  ·  ,/.: Nudge  ·  Ctrl+Z: Undo")
-                    .size(11.0)
-                    .color(brand::MUTED),
+                RichText::new(format!(
+                    "Drag mark: ±1f snap  ·  1–4: Add mark  ·  ,/.: Nudge  ·  {}+Z: Undo",
+                    brand::MOD_KEY
+                ))
+                .size(11.0)
+                .color(brand::MUTED),
             );
         }
     });

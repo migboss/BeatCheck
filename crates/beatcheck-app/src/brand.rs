@@ -12,6 +12,16 @@ pub const BRAND_TAGLINE: &str = "Cut on the beat. Every frame.";
 pub const BRAND_SUBTITLE: &str =
     "Offline neural beat tracking engineered for frame-accurate video editing timelines.";
 
+#[cfg(target_os = "macos")]
+pub const MOD_KEY: &str = "Cmd";
+#[cfg(not(target_os = "macos"))]
+pub const MOD_KEY: &str = "Ctrl";
+
+#[cfg(target_os = "macos")]
+pub const REDO_SHORTCUT: &str = "Cmd+Shift+Z";
+#[cfg(not(target_os = "macos"))]
+pub const REDO_SHORTCUT: &str = "Ctrl+Y";
+
 // =============================================================================
 // 02. COLOR PALETTE — Option A: Obsidian & Electric Violet
 // =============================================================================

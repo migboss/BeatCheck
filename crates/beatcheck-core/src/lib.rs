@@ -251,11 +251,70 @@ mod tests {
         assert_eq!(drop_m.bar, db.bar);
         assert_eq!(drop_m.beat_in_bar, db.beat_in_bar);
 
+        // Verify Locked BPM starts at Bar 1 (never Bar 2!)
+        let first_db = track
+            .marks
+            .iter()
+            .find(|m| m.kind == MarkKind::Downbeat && (m.time_sec - 0.0).abs() < 0.01)
+            .expect("first downbeat at 0.0s");
+        assert_eq!(first_db.bar, 1);
+        assert_eq!(db.bar, 2);
+
         // Add a manual beat at 1.25s and change drop sensitivity — manual beat MUST survive!
         let manual_id = editing::add_mark(&mut track, 1.25, MarkKind::StrongBeat);
         track.drop_sensitivity = 0.0;
         editing::rebuild_energy_drops_only(&mut track);
         assert!(track.marks.iter().any(|m| m.id == manual_id));
         assert!(!track.marks.iter().any(|m| m.kind == MarkKind::EnergyDrop));
+
+        // Tap tempo with extrapolate_silence = false MUST still generate full track beat grid!
+        track.extrapolate_silence = false;
+        editing::apply_tap_tempo(&mut track, 120.0, 2.0);
+        assert!(
+            track.marks.len() >= 18,
+            "Expected full 10s grid at 120 BPM, got {} marks",
+            track.marks.len()
+        );
+    }
+
+    #[test]
+    fn dynamic_two_four_never_emits_consecutive_downbeats() {
+        let mut track = TrackAnalysis {
+            title: "TwoFourTest".into(),
+            file_path: String::new(),
+            sample_rate: 44_100,
+            channels: 2,
+            duration_sec: 5.0,
+            detected_bpm: 120.0,
+            active_bpm: 120.0,
+            bpm_multiplier: 1.0,
+            tempo_stability: 0.7,
+            detected_time_sig: TimeSignature::TwoFour,
+            active_time_sig: TimeSignature::TwoFour,
+            grid_mode: GridMode::Dynamic,
+            detection_engine: "Test".into(),
+            downbeat_phase_shift: 0,
+            extrapolate_silence: false,
+            in_point_sec: 0.0,
+            out_point_sec: 5.0,
+            marks: Vec::new(),
+            raw_beat_times: vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5],
+            // Adjacent noisy raw downbeats at 0.0s and 0.5s
+            raw_downbeat_times: vec![0.0, 0.5, 1.0, 2.0],
+            raw_drops: Vec::new(),
+            drop_sensitivity: 0.5,
+            waveform_bins_per_sec: 200.0,
+            waveform: Vec::new(),
+            next_mark_id: 1,
+        };
+        editing::rebuild_marks_from_raw(&mut track);
+        for w in track.marks.windows(2) {
+            assert!(
+                !(w[0].kind == MarkKind::Downbeat && w[1].kind == MarkKind::Downbeat),
+                "Found consecutive downbeats in 2/4: {:?} -> {:?}",
+                w[0].time_sec,
+                w[1].time_sec
+            );
+        }
     }
 }

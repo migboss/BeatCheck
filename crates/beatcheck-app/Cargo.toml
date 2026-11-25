@@ -18,3 +18,6 @@ rfd.workspace = true
 beatcheck-core = { path = "../beatcheck-core" }
 beatcheck-edl = { path = "../beatcheck-edl" }
 beatcheck-audio = { path = "../beatcheck-audio" }
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

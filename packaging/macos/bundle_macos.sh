@@ -4,6 +4,8 @@ set -euo pipefail
 # Builds a portable, branded macOS BeatCheck.app bundle (run on macOS).
 # Supports universal binary (Apple Silicon + Intel) if both rustup targets are installed.
 
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
+
 APP_DIR="dist/BeatCheck.app"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"

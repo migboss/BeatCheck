@@ -37,6 +37,8 @@ struct SharedControl {
     /// Dedicated seek target written by UI before incrementing `seek_generation` (eliminates TOCTOU race).
     seek_target_bits: AtomicU64,
     seek_generation: AtomicU64,
+    /// Separate generation counter for click-schedule edits so live editing never stutters audio playback!
+    clicks_generation: AtomicU64,
     loop_in_bits: AtomicU64,
     loop_out_bits: AtomicU64,
     music_volume_bits: AtomicU32,
@@ -57,6 +59,7 @@ impl Default for SharedControl {
             playhead_bits: AtomicU64::new(0.0f64.to_bits()),
             seek_target_bits: AtomicU64::new(0.0f64.to_bits()),
             seek_generation: AtomicU64::new(0),
+            clicks_generation: AtomicU64::new(0),
             loop_in_bits: AtomicU64::new(0.0f64.to_bits()),
             loop_out_bits: AtomicU64::new(0.0f64.to_bits()),
             music_volume_bits: AtomicU32::new(0.85f32.to_bits()),
@@ -73,6 +76,8 @@ struct CallbackEngine {
     voices: [Option<ClickVoice>; MAX_VOICES],
     next_click_idx: usize,
     last_seek_gen: u64,
+    last_clicks_gen: u64,
+    needs_click_resync: bool,
     local_pos: f64,
     gain_ramp: f32,
 }
@@ -84,6 +89,8 @@ impl CallbackEngine {
             voices: [None; MAX_VOICES],
             next_click_idx: 0,
             last_seek_gen: u64::MAX,
+            last_clicks_gen: u64::MAX,
+            needs_click_resync: true,
             local_pos: 0.0,
             gain_ramp: 0.0,
         }
@@ -148,17 +155,30 @@ impl CallbackEngine {
             if target.is_finite() {
                 self.local_pos = target.max(0.0);
             }
-            if let Some(buf) = buf_guard.as_ref() {
-                self.next_click_idx = buf
-                    .clicks
-                    .partition_point(|&(t, _)| t < self.local_pos - 0.002);
-            }
+            self.needs_click_resync = true;
             for v in &mut self.voices {
                 if let Some(voice) = v {
                     if !voice.is_test_tone {
                         *v = None;
                     }
                 }
+            }
+        }
+
+        let clicks_gen = ctrl.clicks_generation.load(Ordering::Acquire);
+        if clicks_gen != self.last_clicks_gen {
+            self.last_clicks_gen = clicks_gen;
+            self.needs_click_resync = true;
+        }
+
+        // Only clear `needs_click_resync` once we actually hold `buf_guard` so a contended try_lock()
+        // never permanently silences metronome clicks!
+        if self.needs_click_resync {
+            if let Some(buf) = buf_guard.as_ref() {
+                self.next_click_idx = buf
+                    .clicks
+                    .partition_point(|&(t, _)| t < self.local_pos - 0.002);
+                self.needs_click_resync = false;
             }
         }
 
@@ -419,14 +439,11 @@ impl AudioPlayer {
     }
 
     pub fn update_marks(&self, marks: &[BeatMark]) {
-        let cur = self.position_sec();
         if let Ok(mut buf) = self.buffer.lock() {
             buf.clicks = extract_click_schedule(marks);
         }
-        self.ctrl
-            .seek_target_bits
-            .store(cur.to_bits(), Ordering::Relaxed);
-        self.ctrl.seek_generation.fetch_add(1, Ordering::Release);
+        // Only bump clicks_generation so audio playback never stutters or seeks backward during live edits!
+        self.ctrl.clicks_generation.fetch_add(1, Ordering::Release);
     }
 
     pub fn is_playing(&self) -> bool {

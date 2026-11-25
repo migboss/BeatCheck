@@ -53,14 +53,18 @@ pub fn export_fcpxml(
     xml.push_str("<fcpxml version=\"1.9\">\n");
     xml.push_str("  <resources>\n");
     xml.push_str(&format!(
-        "    <format id=\"r1\" name=\"FFVideoFormat1080p{}\" frameDuration=\"{frame_dur}\" width=\"1920\" height=\"1080\"/>\n",
-        fps.nominal_fps()
+        "    <format id=\"r1\" name=\"{}\" frameDuration=\"{frame_dur}\" width=\"1920\" height=\"1080\"/>\n",
+        fps.fcpxml_format_name()
     ));
     xml.push_str(&format!(
-        "    <asset id=\"r2\" name=\"{clip_name}\" src=\"{file_uri}\" start=\"0s\" duration=\"{asset_dur_str}\" hasAudio=\"1\" audioSources=\"1\" audioChannels=\"{}\" audioRate=\"{}\"/>\n",
+        "    <asset id=\"r2\" name=\"{clip_name}\" start=\"0s\" duration=\"{asset_dur_str}\" hasAudio=\"1\" audioSources=\"1\" audioChannels=\"{}\" audioRate=\"{}\">\n",
         track.channels.max(1),
         track.sample_rate.max(44100)
     ));
+    xml.push_str(&format!(
+        "      <media-rep kind=\"original-media\" src=\"{file_uri}\"/>\n"
+    ));
+    xml.push_str("    </asset>\n");
     xml.push_str("  </resources>\n");
     xml.push_str("  <library>\n");
     xml.push_str(&format!("    <event name=\"{title}\">\n"));
@@ -177,10 +181,19 @@ mod tests {
         };
         let xml = export_fcpxml(&track, &ExportSettings::default()).unwrap();
         assert!(xml.contains("<fcpxml version=\"1.9\">"));
-        assert!(xml.contains("file://localhost/F:/Music/Neon%20Beat.mp3"));
+        assert!(xml.contains("<media-rep kind=\"original-media\" src=\"file://localhost/F:/Music/Neon%20Beat.mp3\"/>"));
+        assert!(!xml.contains("<asset id=\"r2\" name=\"Neon Beat.mp3\" src="));
+        assert!(xml.contains("name=\"FFVideoFormat1080p25\""));
         assert!(xml.contains("frameDuration=\"1/25s\""));
         assert!(xml.contains("start=\"25/25s\""));
         assert!(xml.contains("ResolveColorRed"));
+
+        // NTSC pulldown rate uses FFVideoFormat1080p2398 (required by Final Cut Pro)
+        let mut ntsc = ExportSettings::default();
+        ntsc.frame_rate = crate::FrameRate::Fps23_976;
+        let xml_ntsc = export_fcpxml(&track, &ntsc).unwrap();
+        assert!(xml_ntsc.contains("name=\"FFVideoFormat1080p2398\""));
+        assert!(xml_ntsc.contains("frameDuration=\"1001/24000s\""));
     }
 
     #[test]

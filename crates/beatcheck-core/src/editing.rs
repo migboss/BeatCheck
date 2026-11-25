@@ -179,7 +179,7 @@ pub fn rebuild_marks_from_raw(track: &mut TrackAnalysis) {
                 bar_num += 1;
                 beat_in_bar = (bpb - shift) % bpb;
                 beat_in_bar == 0
-            } else if raw_db_here && beat_in_bar + 1 >= bpb.saturating_sub(1) {
+            } else if raw_db_here && beat_in_bar >= 1 && beat_in_bar + 1 >= bpb.saturating_sub(1) {
                 bar_num += 1;
                 beat_in_bar = 0;
                 true
@@ -217,10 +217,11 @@ pub fn rebuild_marks_from_raw(track: &mut TrackAnalysis) {
             next_id += 1;
         }
     } else {
+        let phase_offset = (bpb - global_phase) % bpb;
         for (idx, &t) in beat_times.iter().enumerate() {
-            let pos_in_bar = (idx + bpb - global_phase) % bpb;
+            let pos_in_bar = (idx + phase_offset) % bpb;
             let beat_in_bar = (pos_in_bar + 1) as u8;
-            let bar = ((idx + bpb - global_phase) / bpb) as u32 + 1;
+            let bar = ((idx + phase_offset) / bpb) as u32 + 1;
             let kind = if beat_in_bar == 1 {
                 MarkKind::Downbeat
             } else if track.active_time_sig.is_strong_beat(beat_in_bar) {
@@ -254,6 +255,7 @@ pub fn rebuild_marks_from_raw(track: &mut TrackAnalysis) {
         let mut snapped_t = drop_t;
         let mut bar = 1u32;
         let mut beat_in_bar = 1u8;
+        let mut matched_db = false;
         if let Some(nearest) = marks
             .iter()
             .filter(|m| m.kind == MarkKind::Downbeat)
@@ -268,12 +270,20 @@ pub fn rebuild_marks_from_raw(track: &mut TrackAnalysis) {
                 snapped_t = nearest.time_sec;
                 bar = nearest.bar;
                 beat_in_bar = nearest.beat_in_bar;
-            } else if let Some(any_beat) = marks.iter().min_by(|a, b| {
-                (a.time_sec - drop_t)
-                    .abs()
-                    .partial_cmp(&(b.time_sec - drop_t).abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }) {
+                matched_db = true;
+            }
+        }
+        if !matched_db {
+            if let Some(any_beat) = marks
+                .iter()
+                .filter(|m| m.kind != MarkKind::EnergyDrop)
+                .min_by(|a, b| {
+                    (a.time_sec - drop_t)
+                        .abs()
+                        .partial_cmp(&(b.time_sec - drop_t).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+            {
                 bar = any_beat.bar;
                 beat_in_bar = any_beat.beat_in_bar;
             }
@@ -298,12 +308,15 @@ pub fn rebuild_marks_from_raw(track: &mut TrackAnalysis) {
     track.next_mark_id = next_id;
 }
 
-pub fn toggle_bpm_multiplier(track: &mut TrackAnalysis, factor: f64) {
+pub fn toggle_bpm_multiplier(track: &mut TrackAnalysis, factor: f64) -> bool {
     let next = track.bpm_multiplier * factor;
     let candidate_bpm = track.detected_bpm * next;
     if (35.0..=260.0).contains(&candidate_bpm) {
         track.bpm_multiplier = next;
         rebuild_marks_from_raw(track);
+        true
+    } else {
+        false
     }
 }
 
@@ -332,6 +345,7 @@ pub fn rebuild_energy_drops_only(track: &mut TrackAnalysis) {
         let mut snapped_t = drop_t;
         let mut bar = 1u32;
         let mut beat_in_bar = 1u8;
+        let mut matched_db = false;
         if let Some(&(db_t, _, db_bar, db_beat)) = beats_snapshot
             .iter()
             .filter(|m| m.1 == MarkKind::Downbeat)
@@ -346,7 +360,11 @@ pub fn rebuild_energy_drops_only(track: &mut TrackAnalysis) {
                 snapped_t = db_t;
                 bar = db_bar;
                 beat_in_bar = db_beat;
-            } else if let Some(&(_, _, any_bar, any_beat)) = beats_snapshot.iter().min_by(|a, b| {
+                matched_db = true;
+            }
+        }
+        if !matched_db {
+            if let Some(&(_, _, any_bar, any_beat)) = beats_snapshot.iter().min_by(|a, b| {
                 (a.0 - drop_t)
                     .abs()
                     .partial_cmp(&(b.0 - drop_t).abs())
@@ -402,6 +420,7 @@ pub fn apply_tap_tempo(track: &mut TrackAnalysis, tapped_bpm: f64, anchor_time_s
     track.detected_bpm = (tapped_bpm * 10.0).round() / 10.0;
     track.bpm_multiplier = 1.0;
     track.grid_mode = GridMode::LockedConstantBpm;
+    track.extrapolate_silence = true;
     track.raw_downbeat_times = vec![anchor_time_sec.clamp(0.0, track.duration_sec)];
     track.raw_beat_times = vec![anchor_time_sec.clamp(0.0, track.duration_sec)];
     track.downbeat_phase_shift = 0;
