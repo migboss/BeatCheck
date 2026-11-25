@@ -1,4 +1,5 @@
 use crate::brand::{self, StrokeIcon};
+use crate::shortcuts::{KeyBindings, ShortcutAction};
 use beatcheck_edl::ExportSettings;
 use egui::{Align, CornerRadius, Frame, Layout, Margin, RichText, Stroke, Ui, Vec2};
 use std::path::PathBuf;
@@ -7,6 +8,7 @@ use std::path::PathBuf;
 pub struct LaunchActions {
     pub open_file_dialog: bool,
     pub open_recent_path: Option<PathBuf>,
+    pub open_shortcuts_page: bool,
 }
 
 /// Option B: Split Welcome & Resolve Guide
@@ -14,12 +16,13 @@ pub struct LaunchActions {
 pub fn draw_split_welcome_screen(
     ui: &mut Ui,
     export: &ExportSettings,
+    shortcuts: &KeyBindings,
     recent_files: &[String],
     actions: &mut LaunchActions,
 ) {
     let avail = ui.available_size();
-    let max_w = avail.x.min(940.0).max(620.0);
-    let side_pad = ((avail.x - max_w) * 0.5).max(16.0);
+    let max_w = (avail.x - 24.0).clamp(480.0, 940.0);
+    let side_pad = ((avail.x - max_w) * 0.5).max(8.0);
     let top_pad = ((avail.y - 430.0) * 0.44).max(20.0);
 
     egui::ScrollArea::vertical()
@@ -97,7 +100,10 @@ pub fn draw_split_welcome_screen(
                                                 if brand::primary_cta_button(
                                                     ui,
                                                     Some(StrokeIcon::Folder),
-                                                    &format!("Import Audio Track  ({}+O)", brand::MOD_KEY),
+                                                    &format!(
+                                                        "Import Audio Track  ({})",
+                                                        shortcuts.short_label(ShortcutAction::OpenFile)
+                                                    ),
                                                     Vec2::new(236.0, 38.0),
                                                 )
                                                 .clicked()
@@ -207,16 +213,68 @@ pub fn draw_split_welcome_screen(
                                             ui.add_space(4.0);
                                         }
                                     } else {
-                                        ui.label(
-                                            RichText::new("ESSENTIAL SHORTCUTS")
-                                                .font(brand::font_mono_bold(10.5))
-                                                .color(brand::HIGHLIGHT),
-                                        );
+                                        ui.horizontal(|ui| {
+                                            ui.label(
+                                                RichText::new("ESSENTIAL SHORTCUTS")
+                                                    .font(brand::font_mono_bold(10.5))
+                                                    .color(brand::HIGHLIGHT),
+                                            );
+                                            ui.with_layout(
+                                                Layout::right_to_left(Align::Center),
+                                                |ui| {
+                                                    if ui
+                                                        .small_button("Customize")
+                                                        .on_hover_text(
+                                                            "Open the Keyboard Shortcuts page",
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        actions.open_shortcuts_page = true;
+                                                    }
+                                                },
+                                            );
+                                        });
                                         ui.add_space(8.0);
-                                        draw_shortcut_row(ui, "Space", "Play / Pause audio");
-                                        draw_shortcut_row(ui, "1 / 2 / 3 / 4", "Drop Downbeat / Strong / Beat / Drop at playhead");
-                                        draw_shortcut_row(ui, ",  /  .", "Move selected marker -1 / +1 frame");
-                                        draw_shortcut_row(ui, "M", "Toggle sample-accurate metronome click");
+                                        draw_shortcut_row(
+                                            ui,
+                                            &shortcuts.short_label(ShortcutAction::PlayPause),
+                                            "Play / Pause audio",
+                                        );
+                                        draw_shortcut_row(
+                                            ui,
+                                            &shortcuts.label(ShortcutAction::AddRegularBeat),
+                                            &format!(
+                                                "Drop Beat marker ({}/{}/{} for other types)",
+                                                shortcuts.short_label(ShortcutAction::AddDownbeat),
+                                                shortcuts.short_label(ShortcutAction::AddStrongBeat),
+                                                shortcuts.short_label(ShortcutAction::AddEnergyDrop),
+                                            ),
+                                        );
+                                        draw_shortcut_row(
+                                            ui,
+                                            &format!(
+                                                "{} / {}",
+                                                shortcuts.short_label(ShortcutAction::StepFrameBack),
+                                                shortcuts
+                                                    .short_label(ShortcutAction::StepFrameForward)
+                                            ),
+                                            "Step playhead -1 / +1 frame",
+                                        );
+                                        draw_shortcut_row(
+                                            ui,
+                                            &format!(
+                                                "{} / {}",
+                                                shortcuts.short_label(ShortcutAction::NudgeMarkBack),
+                                                shortcuts
+                                                    .short_label(ShortcutAction::NudgeMarkForward)
+                                            ),
+                                            "Move selected marker -1 / +1 frame",
+                                        );
+                                        draw_shortcut_row(
+                                            ui,
+                                            &shortcuts.short_label(ShortcutAction::ToggleMetronome),
+                                            "Toggle sample-accurate metronome click",
+                                        );
                                     }
                                 });
                         });

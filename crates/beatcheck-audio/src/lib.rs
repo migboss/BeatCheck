@@ -37,6 +37,8 @@ struct SharedControl {
     /// Dedicated seek target written by UI before incrementing `seek_generation` (eliminates TOCTOU race).
     seek_target_bits: AtomicU64,
     seek_generation: AtomicU64,
+    /// Last `seek_generation` applied by the audio callback so rapid paused seeks never flicker back.
+    applied_seek_generation: AtomicU64,
     /// Separate generation counter for click-schedule edits so live editing never stutters audio playback!
     clicks_generation: AtomicU64,
     loop_in_bits: AtomicU64,
@@ -59,6 +61,7 @@ impl Default for SharedControl {
             playhead_bits: AtomicU64::new(0.0f64.to_bits()),
             seek_target_bits: AtomicU64::new(0.0f64.to_bits()),
             seek_generation: AtomicU64::new(0),
+            applied_seek_generation: AtomicU64::new(0),
             clicks_generation: AtomicU64::new(0),
             loop_in_bits: AtomicU64::new(0.0f64.to_bits()),
             loop_out_bits: AtomicU64::new(0.0f64.to_bits()),
@@ -151,7 +154,7 @@ impl CallbackEngine {
         let seek_gen = ctrl.seek_generation.load(Ordering::Acquire);
         if seek_gen != self.last_seek_gen {
             self.last_seek_gen = seek_gen;
-            let target = f64::from_bits(ctrl.seek_target_bits.load(Ordering::Relaxed));
+            let target = f64::from_bits(ctrl.seek_target_bits.load(Ordering::Acquire));
             if target.is_finite() {
                 self.local_pos = target.max(0.0);
             }
@@ -293,7 +296,9 @@ impl CallbackEngine {
         }
 
         ctrl.playhead_bits
-            .store(self.local_pos.to_bits(), Ordering::Relaxed);
+            .store(self.local_pos.to_bits(), Ordering::Release);
+        ctrl.applied_seek_generation
+            .store(self.last_seek_gen, Ordering::Release);
         ctrl.output_peak_bits
             .store(peak.to_bits(), Ordering::Relaxed);
         ctrl.callback_ticks.fetch_add(1, Ordering::Relaxed);
@@ -381,10 +386,14 @@ impl AudioPlayer {
     }
 
     fn open_stream(&mut self, device_name: Option<String>) -> Result<()> {
+        let preserved_pos = self.position_sec();
         self.stream = None;
         if let Ok(mut e) = self.stream_error.lock() {
             *e = None;
         }
+        // Seed seek target BEFORE starting the new CallbackEngine so its very first callback
+        // adopts the exact current playhead instead of any older seek target.
+        self.seek(preserved_pos);
 
         match create_output_stream(
             Arc::clone(&self.buffer),
@@ -404,9 +413,6 @@ impl AudioPlayer {
                 self.active_device_name = dev_name;
                 self.active_format_info = fmt_info;
                 self.init_error = None;
-                // Re-sync playhead in the newly created callback engine
-                let cur = self.position_sec();
-                self.seek(cur);
                 Ok(())
             }
             Err(err) => {
@@ -475,7 +481,13 @@ impl AudioPlayer {
     }
 
     pub fn position_sec(&self) -> f64 {
-        f64::from_bits(self.ctrl.playhead_bits.load(Ordering::Relaxed))
+        let applied = self.ctrl.applied_seek_generation.load(Ordering::Acquire);
+        let req = self.ctrl.seek_generation.load(Ordering::Acquire);
+        if req != applied {
+            f64::from_bits(self.ctrl.seek_target_bits.load(Ordering::Acquire))
+        } else {
+            f64::from_bits(self.ctrl.playhead_bits.load(Ordering::Acquire))
+        }
     }
 
     pub fn seek(&self, sec: f64) {
@@ -490,7 +502,7 @@ impl AudioPlayer {
         let clamped = sec.clamp(0.0, dur.max(0.0));
         self.ctrl
             .seek_target_bits
-            .store(clamped.to_bits(), Ordering::Relaxed);
+            .store(clamped.to_bits(), Ordering::Release);
         self.ctrl
             .playhead_bits
             .store(clamped.to_bits(), Ordering::Relaxed);

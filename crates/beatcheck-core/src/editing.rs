@@ -530,6 +530,28 @@ pub fn move_mark(track: &mut TrackAnalysis, id: u64, new_time_sec: f64) {
     sort_and_renumber_marks(track);
 }
 
+/// Move multiple marks in one batch and renumber once (O(N + K) for smooth live group dragging).
+pub fn move_marks(track: &mut TrackAnalysis, updates: &[(u64, f64)]) {
+    if updates.is_empty() {
+        return;
+    }
+    let dur = track.duration_sec;
+    let by_id: std::collections::HashMap<u64, (f64, f32)> = updates
+        .iter()
+        .map(|&(id, raw_t)| {
+            let t = raw_t.clamp(0.0, dur);
+            (id, (t, sample_waveform_energy(track, t)))
+        })
+        .collect();
+    for m in &mut track.marks {
+        if let Some(&(t, energy)) = by_id.get(&m.id) {
+            m.time_sec = t;
+            m.energy = energy;
+        }
+    }
+    sort_and_renumber_marks(track);
+}
+
 pub fn delete_mark(track: &mut TrackAnalysis, id: u64) -> bool {
     let before = track.marks.len();
     track.marks.retain(|m| m.id != id);
@@ -541,11 +563,47 @@ pub fn delete_mark(track: &mut TrackAnalysis, id: u64) -> bool {
     }
 }
 
+/// Delete multiple marks by ID in one batch and renumber once. Returns number removed.
+pub fn delete_marks(track: &mut TrackAnalysis, ids: &std::collections::HashSet<u64>) -> usize {
+    if ids.is_empty() {
+        return 0;
+    }
+    let before = track.marks.len();
+    track.marks.retain(|m| !ids.contains(&m.id));
+    let removed = before.saturating_sub(track.marks.len());
+    if removed > 0 {
+        sort_and_renumber_marks(track);
+    }
+    removed
+}
+
 pub fn reclassify_mark(track: &mut TrackAnalysis, id: u64, new_kind: MarkKind) {
     if let Some(m) = track.marks.iter_mut().find(|m| m.id == id) {
         m.kind = new_kind;
     }
     sort_and_renumber_marks(track);
+}
+
+/// Reclassify multiple marks by ID in one batch and renumber once. Returns number updated.
+pub fn reclassify_marks(
+    track: &mut TrackAnalysis,
+    ids: &std::collections::HashSet<u64>,
+    new_kind: MarkKind,
+) -> usize {
+    if ids.is_empty() {
+        return 0;
+    }
+    let mut changed = 0usize;
+    for m in &mut track.marks {
+        if ids.contains(&m.id) {
+            m.kind = new_kind;
+            changed += 1;
+        }
+    }
+    if changed > 0 {
+        sort_and_renumber_marks(track);
+    }
+    changed
 }
 
 pub fn set_mark_label(track: &mut TrackAnalysis, id: u64, label: Option<String>) {
@@ -677,4 +735,107 @@ fn sample_waveform_energy(track: &TrackAnalysis, time_sec: f64) -> f32 {
     let idx = ((time_sec * track.waveform_bins_per_sec as f64).round() as usize)
         .min(track.waveform.len() - 1);
     track.waveform[idx].peak
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn sample_track() -> TrackAnalysis {
+        TrackAnalysis {
+            title: "Test".into(),
+            file_path: String::new(),
+            sample_rate: 44100,
+            channels: 2,
+            duration_sec: 10.0,
+            detected_bpm: 120.0,
+            active_bpm: 120.0,
+            bpm_multiplier: 1.0,
+            tempo_stability: 1.0,
+            detected_time_sig: TimeSignature::FourFour,
+            active_time_sig: TimeSignature::FourFour,
+            grid_mode: GridMode::LockedConstantBpm,
+            detection_engine: "test".into(),
+            downbeat_phase_shift: 0,
+            extrapolate_silence: false,
+            in_point_sec: 0.0,
+            out_point_sec: 10.0,
+            marks: vec![
+                BeatMark {
+                    id: 1,
+                    time_sec: 1.0,
+                    kind: MarkKind::Downbeat,
+                    bar: 1,
+                    beat_in_bar: 1,
+                    energy: 0.8,
+                    confidence: 1.0,
+                    custom_label: None,
+                },
+                BeatMark {
+                    id: 2,
+                    time_sec: 1.5,
+                    kind: MarkKind::RegularBeat,
+                    bar: 1,
+                    beat_in_bar: 2,
+                    energy: 0.5,
+                    confidence: 1.0,
+                    custom_label: None,
+                },
+                BeatMark {
+                    id: 3,
+                    time_sec: 3.0,
+                    kind: MarkKind::Downbeat,
+                    bar: 2,
+                    beat_in_bar: 1,
+                    energy: 0.9,
+                    confidence: 1.0,
+                    custom_label: None,
+                },
+                BeatMark {
+                    id: 4,
+                    time_sec: 5.0,
+                    kind: MarkKind::Downbeat,
+                    bar: 3,
+                    beat_in_bar: 1,
+                    energy: 0.9,
+                    confidence: 1.0,
+                    custom_label: None,
+                },
+            ],
+            raw_beat_times: vec![],
+            raw_downbeat_times: vec![],
+            raw_drops: vec![],
+            drop_sensitivity: 0.5,
+            waveform_bins_per_sec: 100.0,
+            waveform: vec![],
+            next_mark_id: 5,
+        }
+    }
+
+    #[test]
+    fn batch_move_reclassify_and_delete_preserve_other_marks() {
+        let mut track = sample_track();
+        let selected: HashSet<u64> = [1, 3].into_iter().collect();
+
+        // Batch move selected downbeats +0.2s while leaving id=2 and id=4 untouched
+        move_marks(&mut track, &[(1, 1.2), (3, 3.2)]);
+        assert!((track.marks.iter().find(|m| m.id == 1).unwrap().time_sec - 1.2).abs() < 1e-9);
+        assert!((track.marks.iter().find(|m| m.id == 2).unwrap().time_sec - 1.5).abs() < 1e-9);
+        assert!((track.marks.iter().find(|m| m.id == 3).unwrap().time_sec - 3.2).abs() < 1e-9);
+        assert!((track.marks.iter().find(|m| m.id == 4).unwrap().time_sec - 5.0).abs() < 1e-9);
+
+        // Batch reclassify selected marks to EnergyDrop
+        let changed = reclassify_marks(&mut track, &selected, MarkKind::EnergyDrop);
+        assert_eq!(changed, 2);
+        assert_eq!(track.marks.iter().find(|m| m.id == 1).unwrap().kind, MarkKind::EnergyDrop);
+        assert_eq!(track.marks.iter().find(|m| m.id == 3).unwrap().kind, MarkKind::EnergyDrop);
+        assert_eq!(track.marks.iter().find(|m| m.id == 2).unwrap().kind, MarkKind::RegularBeat);
+
+        // Batch delete selected marks
+        let removed = delete_marks(&mut track, &selected);
+        assert_eq!(removed, 2);
+        let remaining_ids: Vec<u64> = track.marks.iter().map(|m| m.id).collect();
+        assert_eq!(remaining_ids, vec![2, 4]);
+    }
 }

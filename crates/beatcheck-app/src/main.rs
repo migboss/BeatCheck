@@ -6,6 +6,7 @@ mod config;
 mod export_panel;
 mod hud;
 mod launch;
+mod shortcuts;
 mod waveform;
 
 use app::BeatCheckApp;

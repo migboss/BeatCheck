@@ -1,5 +1,8 @@
 use crate::brand;
-use crate::config::{format_live_smpte, mark_color32, ScrollMode, WaveformVisualMode};
+use crate::config::{
+    format_live_smpte, mark_color32, step_time_by_frames, ScrollMode, WaveformVisualMode,
+};
+use crate::shortcuts::{KeyBindings, ShortcutAction};
 use beatcheck_core::editing;
 use beatcheck_core::model::{MarkExportStyle, MarkKind, TrackAnalysis};
 use beatcheck_edl::ExportSettings;
@@ -7,6 +10,7 @@ use egui::{
     epaint::{Mesh, PathShape, Vertex, WHITE_UV},
     Align2, Color32, CursorIcon, Pos2, Rect, Response, Sense, Shape, Stroke, StrokeKind, Ui, Vec2,
 };
+use std::collections::HashSet;
 
 #[derive(Debug, Clone)]
 pub struct WaveformState {
@@ -14,14 +18,27 @@ pub struct WaveformState {
     pub pixels_per_sec: f32,
     /// Leftmost visible time in seconds (used in PageScroll mode and when paused).
     pub view_start_sec: f64,
-    /// Currently selected mark ID.
-    pub selected_mark_id: Option<u64>,
-    /// Mark currently being dragged with mouse.
+    /// Currently selected mark IDs (supports single click, Shift+Click toggle, and marquee box drag).
+    pub selected_mark_ids: HashSet<u64>,
+    /// Anchor mark currently being dragged with mouse (moves all `selected_mark_ids` together).
     pub dragging_mark_id: Option<u64>,
-    /// Original timestamp of the mark when drag started (for live +/- frame delta HUD).
+    /// Original timestamp of the anchor mark when drag started (for live +/- frame delta HUD).
     pub drag_origin_sec: f64,
+    /// Original displayed (quantized) timestamp of the anchor mark when drag started.
+    pub drag_origin_display_sec: f64,
+    /// Original `(mark_id, time_sec)` of every mark participating in the active drag gesture.
+    pub drag_origin_times: Vec<(u64, f64)>,
+    /// Last applied time delta during an active drag (avoids no-op Undo snapshots & 60Hz click rebuilds).
+    pub drag_last_applied_delta: f64,
     /// Whether an Undo snapshot was already pushed for the current drag gesture.
     pub drag_snapshot_pushed: bool,
+    /// Active drag-to-select marquee box on the waveform: `(time_sec, screen_y)`.
+    pub marquee_start: Option<(f64, f32)>,
+    pub marquee_current: Option<(f64, f32)>,
+    /// Pre-drag selection snapshot when holding Shift during a marquee drag.
+    pub marquee_base_selection: HashSet<u64>,
+    /// True while dragging on the top ruler to scrub the playhead.
+    pub scrubbing_ruler: bool,
     /// Context menu target mark ID and persisted timeline position (so empty-timeline popup never blanks!).
     pub context_mark_id: Option<u64>,
     pub context_time_sec: Option<f64>,
@@ -35,16 +52,59 @@ impl Default for WaveformState {
         Self {
             pixels_per_sec: 115.0,
             view_start_sec: 0.0,
-            selected_mark_id: None,
+            selected_mark_ids: HashSet::new(),
             dragging_mark_id: None,
             drag_origin_sec: 0.0,
+            drag_origin_display_sec: 0.0,
+            drag_origin_times: Vec::new(),
+            drag_last_applied_delta: 0.0,
             drag_snapshot_pushed: false,
+            marquee_start: None,
+            marquee_current: None,
+            marquee_base_selection: HashSet::new(),
+            scrubbing_ruler: false,
             context_mark_id: None,
             context_time_sec: None,
             label_edit_buf: String::new(),
             dragging_in_handle: false,
             dragging_out_handle: false,
         }
+    }
+}
+
+impl WaveformState {
+    pub fn select_single(&mut self, id: u64) {
+        self.selected_mark_ids.clear();
+        self.selected_mark_ids.insert(id);
+    }
+
+    pub fn toggle_selected(&mut self, id: u64) {
+        if !self.selected_mark_ids.remove(&id) {
+            self.selected_mark_ids.insert(id);
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected_mark_ids.clear();
+        self.cancel_active_gestures();
+    }
+
+    pub fn cancel_active_gestures(&mut self) {
+        self.dragging_mark_id = None;
+        self.drag_origin_times.clear();
+        self.drag_last_applied_delta = 0.0;
+        self.drag_snapshot_pushed = false;
+        self.marquee_start = None;
+        self.marquee_current = None;
+        self.marquee_base_selection.clear();
+    }
+
+    pub fn is_selected(&self, id: u64) -> bool {
+        self.selected_mark_ids.contains(&id)
+    }
+
+    pub fn selected_count(&self) -> usize {
+        self.selected_mark_ids.len()
     }
 }
 
@@ -197,7 +257,12 @@ pub fn draw_mini_overview(
     actions: &mut WaveformActions,
 ) {
     let desired = Vec2::new(ui.available_width(), 42.0);
-    let (rect, resp) = ui.allocate_exact_size(desired, Sense::click_and_drag());
+    let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+    let resp = ui.interact(
+        rect,
+        egui::Id::new("beatcheck_mini_overview"),
+        Sense::click_and_drag(),
+    );
     let painter = ui.painter_at(rect);
 
     painter.rect_filled(rect, 8.0, brand::CANVAS);
@@ -376,6 +441,7 @@ pub fn draw_main_waveform(
     track: &mut TrackAnalysis,
     wf: &mut WaveformState,
     export: &ExportSettings,
+    shortcuts: &KeyBindings,
     visual_mode: WaveformVisualMode,
     scroll_mode: ScrollMode,
     playhead_sec: f64,
@@ -387,7 +453,12 @@ pub fn draw_main_waveform(
 
     let avail = ui.available_size();
     let desired = Vec2::new(avail.x.max(200.0), avail.y.max(200.0));
-    let (rect, resp) = ui.allocate_exact_size(desired, Sense::click_and_drag());
+    let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+    let resp = ui.interact(
+        rect,
+        egui::Id::new("beatcheck_main_waveform"),
+        Sense::click_and_drag(),
+    );
 
     let dur = track.duration_sec.max(0.01);
     let min_pps = (rect.width() / dur as f32).min(15.0).max(0.5);
@@ -503,6 +574,35 @@ pub fn draw_main_waveform(
         );
     }
 
+    // Subtle video-frame grid lines when zoomed in (anchored to export origin so rebased grids match Resolve!)
+    let grid_origin_sec = export.export_origin_sec(track.in_point_sec);
+    let frame_px = (frame_sec as f32) * pps;
+    if frame_px >= 12.0 {
+        let first_f = export
+            .frame_rate
+            .seconds_to_frames(wf.view_start_sec - grid_origin_sec)
+            - 1;
+        let last_f = export
+            .frame_rate
+            .seconds_to_frames(view_end_sec - grid_origin_sec)
+            + 1;
+        let grid_alpha = ((frame_px - 12.0) * 1.4).clamp(10.0, 26.0) as u8;
+        let grid_col = Color32::from_rgba_unmultiplied(255, 255, 255, grid_alpha);
+        for f in first_f..=last_f {
+            let t = grid_origin_sec + export.frame_rate.frames_to_seconds(f);
+            if t < 0.0 || t > dur {
+                continue;
+            }
+            let fx = time_to_x(t);
+            if fx >= wave_rect.left() && fx <= wave_rect.right() {
+                painter.line_segment(
+                    [Pos2::new(fx, wave_rect.top()), Pos2::new(fx, wave_rect.bottom())],
+                    Stroke::new(1.0, grid_col),
+                );
+            }
+        }
+    }
+
     // 1. Render Waveform (Precise Outline | HD Solid Actual Waveform | DJ RGB Bands)
     let px = time_to_x(playhead_sec);
     if !track.waveform.is_empty() {
@@ -532,13 +632,18 @@ pub fn draw_main_waveform(
                 for node in first_node..=last_node {
                     let b0 = (node * stride).min(track.waveform.len() - 1);
                     let b1 = ((node + 1) * stride).min(track.waveform.len()).max(b0 + 1);
-                    let mut peak = 0.0f32;
-                    for bin in &track.waveform[b0..b1] {
-                        peak = peak.max(bin.peak);
+                    let mut peak = -1.0f32;
+                    let mut peak_bin = b0;
+                    for (offset, bin) in track.waveform[b0..b1].iter().enumerate() {
+                        if bin.peak > peak {
+                            peak = bin.peak;
+                            peak_bin = b0 + offset;
+                        }
                     }
-                    let t_center = (b0 as f64 + 0.5 * stride as f64) / bins_per_sec;
-                    xs.push(time_to_x(t_center));
-                    hs.push((peak * hd_half_h).max(1.0));
+                    // Anchor vertex at exact peak bin time (±1.25ms) so kick spikes align 1:1 with Resolve!
+                    let t_peak = (peak_bin as f64 + 0.5) / bins_per_sec;
+                    xs.push(time_to_x(t_peak));
+                    hs.push((peak.max(0.0) * hd_half_h).max(1.0));
                 }
 
                 paint_smooth_outline_mesh(&painter, wave_rect, &xs, &hs, mid_y, px, false);
@@ -661,48 +766,87 @@ pub fn draw_main_waveform(
         painter.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 128));
     }
 
-    // 2. Render ONLY enabled/included markers (disabled types vanish cleanly!)
-    // Pre-pass hit-test: pick the closest visible mark within 7px, breaking ties in favor of the
-    // top-painted mark (so a green EnergyDrop drawn on top of a co-located Downbeat wins!).
-    let hover_pos = ui.input(|i| i.pointer.hover_pos());
-    let mut hovered_mark_id: Option<u64> = None;
-    if let Some(hp) = hover_pos {
-        if wave_rect.contains(hp) {
-            let mut best_dist = 7.001f32;
-            for m in &track.marks {
-                if !style.is_mark_included(m)
-                    || m.time_sec < wf.view_start_sec - 0.5
-                    || m.time_sec > view_end_sec + 0.5
-                {
-                    continue;
-                }
-                let x = time_to_x(m.time_sec);
-                let d = (hp.x - x).abs();
-                if d <= best_dist {
-                    best_dist = d;
-                    hovered_mark_id = Some(m.id);
+    // 2. Render ONLY enabled/included markers at their EXACT exported video-frame time (100% WYSIWYG with Resolve!).
+    // When actively holding Alt to sub-frame-drag, preview dragged marks at their live sub-frame position.
+    let (hover_pos, shift_held, alt_held) =
+        ui.input(|i| (i.pointer.hover_pos(), i.modifiers.shift, i.modifiers.alt));
+    let sub_frame_drag_active = wf.dragging_mark_id.is_some() && alt_held;
+    let mark_display_time = |id: u64, raw_t: f64| -> f64 {
+        if sub_frame_drag_active && wf.is_selected(id) {
+            raw_t.clamp(0.0, dur)
+        } else {
+            export
+                .quantized_mark_time_sec(raw_t, track.in_point_sec)
+                .clamp(0.0, dur)
+        }
+    };
+
+    // Collect visible marks with their screen X positions for exact hit-testing and density checks.
+    let visible_marks: Vec<(u64, f32)> = track
+        .marks
+        .iter()
+        .filter(|m| {
+            let dt = mark_display_time(m.id, m.time_sec);
+            style.is_mark_included(m)
+                && dt >= wf.view_start_sec - 0.5
+                && dt <= view_end_sec + 0.5
+        })
+        .map(|m| (m.id, time_to_x(mark_display_time(m.id, m.time_sec))))
+        .collect();
+
+    let hit_mark_at = |pt: Pos2, max_dist: f32| -> Option<(u64, f32, f32)> {
+        if !wave_rect.contains(pt) {
+            return None;
+        }
+        let mut best_idx: Option<usize> = None;
+        let mut best_dist = max_dist + 0.001;
+        for (idx, &(_id, mx)) in visible_marks.iter().enumerate() {
+            let d = (pt.x - mx).abs();
+            if d <= best_dist {
+                best_dist = d;
+                best_idx = Some(idx);
+            }
+        }
+        let idx = best_idx?;
+        let (id, mx) = visible_marks[idx];
+        // Compute pixel distance to nearest distinct-x neighbor so densely packed zoomed-out
+        // markers default to marquee box selection rather than accidentally grabbing a single line.
+        let mut min_neighbor_dx = f32::INFINITY;
+        for (j, &(_, ox)) in visible_marks.iter().enumerate() {
+            if j != idx {
+                let dx = (ox - mx).abs();
+                if dx > 0.5 && dx < min_neighbor_dx {
+                    min_neighbor_dx = dx;
                 }
             }
         }
-    }
+        Some((id, best_dist, min_neighbor_dx))
+    };
+
+    let hovered_hit = hover_pos.and_then(|hp| hit_mark_at(hp, 7.0));
+    let hovered_mark_id = hovered_hit.map(|(id, _, _)| id);
+    let can_drag_hovered_mark = hovered_hit.is_some_and(|(id, dist, neighbor_dx)| {
+        !shift_held && (wf.is_selected(id) || (neighbor_dx >= 20.0 && dist <= 5.0))
+    });
 
     for m in &track.marks {
         if !style.is_mark_included(m) {
             continue;
         }
-        if m.time_sec < wf.view_start_sec - 0.5 || m.time_sec > view_end_sec + 0.5 {
+        let disp_t = mark_display_time(m.id, m.time_sec);
+        if disp_t < wf.view_start_sec - 0.5 || disp_t > view_end_sec + 0.5 {
             continue;
         }
-        let x = time_to_x(m.time_sec);
+        let x = time_to_x(disp_t);
         if x < rect.left() - 2.0 || x > rect.right() + 2.0 {
             continue;
         }
 
         let base_col = mark_color32(style, m.kind);
-        let is_selected = wf.selected_mark_id == Some(m.id);
+        let is_selected = wf.is_selected(m.id);
         let is_hovered = hovered_mark_id == Some(m.id) || wf.dragging_mark_id == Some(m.id);
 
-        let dt_after_hit = playhead_sec - m.time_sec;
+        let dt_after_hit = playhead_sec - disp_t;
         let hit_glow = if is_playing && (0.0..=0.14).contains(&dt_after_hit) {
             (1.0 - (dt_after_hit / 0.14) as f32).powi(2)
         } else {
@@ -797,29 +941,55 @@ pub fn draw_main_waveform(
         }
     }
 
-    // 3. Live Floating Frame-Snap HUD Pill while dragging a marker (DaVinci Resolve feel!)
+    // 3. Live Floating Frame-Snap HUD Pill while dragging one or more markers (DaVinci Resolve feel!)
     if let Some(drag_id) = wf.dragging_mark_id {
         if let Some(m) = track.marks.iter().find(|m| m.id == drag_id) {
-            let x = time_to_x(m.time_sec);
-            let delta_frames = ((m.time_sec - wf.drag_origin_sec) / frame_sec).round() as i64;
-            let tc = format_live_smpte(export.frame_rate, &export.start_timecode, m.time_sec);
-            let delta_str = if delta_frames == 0 {
-                "0f".to_string()
-            } else if delta_frames > 0 {
-                format!("+{delta_frames}f")
+            let disp_t = mark_display_time(m.id, m.time_sec);
+            let x = time_to_x(disp_t);
+            let smpte_t = export.mark_smpte_offset_sec(m.time_sec, track.in_point_sec);
+            let tc = format_live_smpte(export.frame_rate, &export.start_timecode, smpte_t);
+            let delta_str = if sub_frame_drag_active {
+                let delta_ms = ((m.time_sec - wf.drag_origin_sec) * 1000.0).round() as i64;
+                format!("{delta_ms:+}ms")
             } else {
-                format!("{delta_frames}f")
+                let delta_frames =
+                    ((disp_t - wf.drag_origin_display_sec) / frame_sec).round() as i64;
+                if delta_frames == 0 {
+                    "0f".to_string()
+                } else if delta_frames > 0 {
+                    format!("+{delta_frames}f")
+                } else {
+                    format!("{delta_frames}f")
+                }
             };
-            let hud_text = format!("{tc}  ({delta_str})");
+            let drag_count = wf.drag_origin_times.len().max(1);
+            let hud_text = if drag_count > 1 {
+                format!("{drag_count} marks · {tc}  ({delta_str})")
+            } else {
+                format!("{tc}  ({delta_str})")
+            };
             let galley = painter.layout_no_wrap(hud_text, brand::font_mono_bold(11.5), brand::TEXT);
             let pill_w = galley.size().x + 16.0;
             let pill_h = 24.0;
-            let pill_x = (x + 10.0).min(wave_rect.right() - pill_w - 6.0).max(wave_rect.left() + 6.0);
-            let pill_rect = Rect::from_min_size(Pos2::new(pill_x, wave_rect.top() + 14.0), Vec2::new(pill_w, pill_h));
+            let pill_x = (x + 10.0)
+                .min(wave_rect.right() - pill_w - 6.0)
+                .max(wave_rect.left() + 6.0);
+            let pill_rect = Rect::from_min_size(
+                Pos2::new(pill_x, wave_rect.top() + 14.0),
+                Vec2::new(pill_w, pill_h),
+            );
             painter.rect_filled(pill_rect, 6.0, brand::PANEL);
-            painter.rect_stroke(pill_rect, 6.0, Stroke::new(1.0, brand::PRIMARY), StrokeKind::Inside);
+            painter.rect_stroke(
+                pill_rect,
+                6.0,
+                Stroke::new(1.0, brand::PRIMARY),
+                StrokeKind::Inside,
+            );
             painter.galley(
-                Pos2::new(pill_rect.left() + 8.0, pill_rect.center().y - galley.size().y * 0.5),
+                Pos2::new(
+                    pill_rect.left() + 8.0,
+                    pill_rect.center().y - galley.size().y * 0.5,
+                ),
                 galley,
                 brand::LAVENDER,
             );
@@ -846,20 +1016,92 @@ pub fn draw_main_waveform(
 
     painter.rect_stroke(rect, 10.0, Stroke::new(1.0, brand::BORDER), StrokeKind::Inside);
 
-    if hovered_mark_id.is_some() || wf.dragging_mark_id.is_some() {
+    if wf.marquee_start.is_some() {
+        ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+    } else if wf.dragging_mark_id.is_some() || can_drag_hovered_mark {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
     }
 
     handle_waveform_interactions(
         ui,
         &resp,
+        ruler_rect,
+        wave_rect,
         track,
+        export,
+        shortcuts,
         wf,
         hovered_mark_id,
+        &hit_mark_at,
         frame_sec,
         &x_to_time,
         actions,
     );
+
+    // 5. Paint active drag-to-select marquee box (zero frame lag!)
+    if let (Some((t0, y0)), Some((t1, y1))) = (wf.marquee_start, wf.marquee_current) {
+        let x0 = time_to_x(t0.min(t1)).clamp(wave_rect.left(), wave_rect.right());
+        let x1 = time_to_x(t0.max(t1)).clamp(wave_rect.left(), wave_rect.right());
+        let top_y = y0.min(y1).clamp(wave_rect.top(), wave_rect.bottom());
+        let bot_y = y0.max(y1).clamp(wave_rect.top(), wave_rect.bottom());
+
+        if (x1 - x0) >= 2.0 {
+            // Full-height timeline range highlight band so user clearly sees which vertical mark lines are inside
+            let band_rect = Rect::from_min_max(
+                Pos2::new(x0, wave_rect.top()),
+                Pos2::new(x1, wave_rect.bottom()),
+            );
+            painter.rect_filled(band_rect, 0.0, brand::primary_tint(20));
+
+            // Crisp dragged selection box
+            let box_rect = Rect::from_min_max(
+                Pos2::new(x0, top_y.min(bot_y - 4.0).max(wave_rect.top())),
+                Pos2::new(x1, bot_y.max(top_y + 4.0).min(wave_rect.bottom())),
+            );
+            painter.rect_filled(box_rect, 3.0, brand::primary_tint(42));
+            painter.rect_stroke(
+                box_rect,
+                3.0,
+                Stroke::new(1.3, brand::HIGHLIGHT),
+                StrokeKind::Inside,
+            );
+
+            // Live selected count badge
+            let count = wf.selected_count();
+            let badge_text = if count == 1 {
+                "1 mark".to_string()
+            } else {
+                format!("{count} marks")
+            };
+            let galley =
+                painter.layout_no_wrap(badge_text, brand::font_mono_bold(10.5), brand::TEXT);
+            let pill_w = galley.size().x + 12.0;
+            let pill_h = 20.0;
+            let pill_x = (x1 + 6.0)
+                .min(wave_rect.right() - pill_w - 6.0)
+                .max(wave_rect.left() + 6.0);
+            let pill_y = (top_y - pill_h - 4.0)
+                .max(wave_rect.top() + 6.0)
+                .min(wave_rect.bottom() - pill_h - 6.0);
+            let pill_rect =
+                Rect::from_min_size(Pos2::new(pill_x, pill_y), Vec2::new(pill_w, pill_h));
+            painter.rect_filled(pill_rect, 5.0, brand::PANEL);
+            painter.rect_stroke(
+                pill_rect,
+                5.0,
+                Stroke::new(1.0, brand::PRIMARY),
+                StrokeKind::Inside,
+            );
+            painter.galley(
+                Pos2::new(
+                    pill_rect.left() + 6.0,
+                    pill_rect.center().y - galley.size().y * 0.5,
+                ),
+                galley,
+                brand::LAVENDER,
+            );
+        }
+    }
 
     rect.width()
 }
@@ -868,14 +1110,21 @@ pub fn draw_main_waveform(
 fn handle_waveform_interactions(
     ui: &mut Ui,
     resp: &Response,
+    ruler_rect: Rect,
+    wave_rect: Rect,
     track: &mut TrackAnalysis,
+    export: &ExportSettings,
+    shortcuts: &KeyBindings,
     wf: &mut WaveformState,
     hovered_mark_id: Option<u64>,
+    hit_mark_at: &impl Fn(Pos2, f32) -> Option<(u64, f32, f32)>,
     frame_sec: f64,
     x_to_time: &impl Fn(f32) -> f64,
     actions: &mut WaveformActions,
 ) {
-    let modifiers = ui.input(|i| i.modifiers);
+    let style = &export.style;
+    let undo_lbl = shortcuts.short_label(ShortcutAction::Undo);
+    let (modifiers, press_origin) = ui.input(|i| (i.modifiers, i.pointer.press_origin()));
 
     // Middle-mouse drag pans viewport
     if resp.dragged_by(egui::PointerButton::Middle) {
@@ -884,38 +1133,115 @@ fn handle_waveform_interactions(
         return;
     }
 
-    // Left-button drag starts moving a hovered mark (snapping frame-by-frame like DaVinci Resolve!)
+    // Left-button drag start:
+    //  1) On the top ruler -> scrub playhead
+    //  2) On an already-selected marker (without Shift), OR on a well-spaced unselected marker (zoomed in, without Shift) -> drag marker(s)
+    //  3) Anywhere else on the waveform body (including dense zoomed-out markers, or whenever Shift is held) -> drag-to-select marquee box!
     if resp.drag_started_by(egui::PointerButton::Primary) {
-        if let Some(mid) = hovered_mark_id {
-            wf.dragging_mark_id = Some(mid);
-            wf.selected_mark_id = Some(mid);
-            wf.drag_origin_sec = track
-                .marks
-                .iter()
-                .find(|m| m.id == mid)
-                .map(|m| m.time_sec)
-                .unwrap_or(0.0);
-            wf.drag_snapshot_pushed = false;
+        if let Some(pos) = resp.interact_pointer_pos() {
+            let origin = press_origin.unwrap_or(pos);
+            if ruler_rect.contains(origin) {
+                wf.scrubbing_ruler = true;
+                let t = x_to_time(pos.x).clamp(0.0, track.duration_sec);
+                actions.seek_to = Some(t);
+            } else {
+                let drag_mark_hit = if modifiers.shift {
+                    None
+                } else {
+                    hit_mark_at(origin, 7.0).and_then(|(id, dist, neighbor_dx)| {
+                        if wf.is_selected(id) || (neighbor_dx >= 20.0 && dist <= 5.0) {
+                            Some(id)
+                        } else {
+                            None
+                        }
+                    })
+                };
+
+                if let Some(mid) = drag_mark_hit {
+                    if !wf.is_selected(mid) {
+                        wf.select_single(mid);
+                    }
+                    wf.dragging_mark_id = Some(mid);
+                    wf.drag_origin_sec = track
+                        .marks
+                        .iter()
+                        .find(|m| m.id == mid)
+                        .map(|m| m.time_sec)
+                        .unwrap_or(0.0);
+                    wf.drag_origin_display_sec = export
+                        .quantized_mark_time_sec(wf.drag_origin_sec, track.in_point_sec)
+                        .clamp(0.0, track.duration_sec);
+                    wf.drag_origin_times = track
+                        .marks
+                        .iter()
+                        .filter(|m| wf.is_selected(m.id))
+                        .map(|m| (m.id, m.time_sec))
+                        .collect();
+                    wf.drag_last_applied_delta = 0.0;
+                    wf.drag_snapshot_pushed = false;
+                } else {
+                    let start_t = x_to_time(origin.x).clamp(0.0, track.duration_sec);
+                    let start_y = origin.y.clamp(wave_rect.top(), wave_rect.bottom());
+                    let cur_t = x_to_time(pos.x).clamp(0.0, track.duration_sec);
+                    let cur_y = pos.y.clamp(wave_rect.top(), wave_rect.bottom());
+                    wf.marquee_base_selection = if modifiers.shift {
+                        wf.selected_mark_ids.clone()
+                    } else {
+                        HashSet::new()
+                    };
+                    wf.marquee_start = Some((start_t, start_y));
+                    wf.marquee_current = Some((cur_t, cur_y));
+                }
+            }
         }
     }
 
     if let Some(drag_id) = wf.dragging_mark_id {
         if resp.dragged_by(egui::PointerButton::Primary) {
             if let Some(pos) = resp.interact_pointer_pos() {
-                if !wf.drag_snapshot_pushed {
-                    actions.undo_snapshot = Some(track.clone());
-                    wf.drag_snapshot_pushed = true;
-                }
                 let raw_t = x_to_time(pos.x).clamp(0.0, track.duration_sec);
-                // Snap cleanly onto exact DaVinci Resolve timeline frames (hold Alt for sub-frame)
-                let new_t = if modifiers.alt {
-                    raw_t
+                let raw_delta = raw_t - wf.drag_origin_display_sec;
+                let snapped_delta = if modifiers.alt {
+                    raw_delta
                 } else {
-                    let frame_idx = (raw_t / frame_sec).round();
-                    (frame_idx * frame_sec).clamp(0.0, track.duration_sec)
+                    (raw_delta / frame_sec).round() * frame_sec
                 };
-                editing::move_mark(track, drag_id, new_t);
-                actions.marks_mutated = true;
+                let min_origin = wf
+                    .drag_origin_times
+                    .iter()
+                    .map(|&(_, t)| t)
+                    .fold(f64::INFINITY, f64::min);
+                let max_origin = wf
+                    .drag_origin_times
+                    .iter()
+                    .map(|&(_, t)| t)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let clamped_delta = if min_origin.is_finite() && max_origin.is_finite() {
+                    snapped_delta.clamp(-min_origin, (track.duration_sec - max_origin).max(0.0))
+                } else {
+                    0.0
+                };
+
+                // Only push an Undo snapshot and rebuild clicks when the snapped position actually moves!
+                if (clamped_delta - wf.drag_last_applied_delta).abs() > 1e-9 {
+                    if !wf.drag_snapshot_pushed {
+                        actions.undo_snapshot = Some(track.clone());
+                        wf.drag_snapshot_pushed = true;
+                    }
+                    if wf.drag_origin_times.len() <= 1 {
+                        let new_t = (wf.drag_origin_sec + clamped_delta).clamp(0.0, track.duration_sec);
+                        editing::move_mark(track, drag_id, new_t);
+                    } else {
+                        let updates: Vec<(u64, f64)> = wf
+                            .drag_origin_times
+                            .iter()
+                            .map(|&(id, orig_t)| (id, orig_t + clamped_delta))
+                            .collect();
+                        editing::move_marks(track, &updates);
+                    }
+                    wf.drag_last_applied_delta = clamped_delta;
+                    actions.marks_mutated = true;
+                }
             }
         }
         if resp.drag_stopped()
@@ -923,7 +1249,50 @@ fn handle_waveform_interactions(
                 && !resp.drag_started_by(egui::PointerButton::Primary))
         {
             wf.dragging_mark_id = None;
+            wf.drag_origin_times.clear();
+            wf.drag_last_applied_delta = 0.0;
             wf.drag_snapshot_pushed = false;
+        }
+    } else if let Some((start_t, _)) = wf.marquee_start {
+        if resp.dragged_by(egui::PointerButton::Primary) {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let cur_t = x_to_time(pos.x).clamp(0.0, track.duration_sec);
+                let cur_y = pos.y.clamp(wave_rect.top(), wave_rect.bottom());
+                wf.marquee_current = Some((cur_t, cur_y));
+                let t_min = start_t.min(cur_t);
+                let t_max = start_t.max(cur_t);
+                let mut next_sel = wf.marquee_base_selection.clone();
+                for m in &track.marks {
+                    let disp_t = export
+                        .quantized_mark_time_sec(m.time_sec, track.in_point_sec)
+                        .clamp(0.0, track.duration_sec);
+                    if style.is_mark_included(m) && disp_t >= t_min && disp_t <= t_max {
+                        next_sel.insert(m.id);
+                    }
+                }
+                wf.selected_mark_ids = next_sel;
+            }
+        }
+        if resp.drag_stopped()
+            || (!resp.dragged_by(egui::PointerButton::Primary)
+                && !resp.drag_started_by(egui::PointerButton::Primary))
+        {
+            wf.marquee_start = None;
+            wf.marquee_current = None;
+            wf.marquee_base_selection.clear();
+        }
+    } else if wf.scrubbing_ruler {
+        if resp.dragged_by(egui::PointerButton::Primary) {
+            if let Some(pos) = resp.interact_pointer_pos() {
+                let t = x_to_time(pos.x).clamp(0.0, track.duration_sec);
+                actions.seek_to = Some(t);
+            }
+        }
+        if resp.drag_stopped()
+            || (!resp.dragged_by(egui::PointerButton::Primary)
+                && !resp.drag_started_by(egui::PointerButton::Primary))
+        {
+            wf.scrubbing_ruler = false;
         }
     } else if resp.clicked_by(egui::PointerButton::Primary) {
         if let Some(pos) = resp.interact_pointer_pos() {
@@ -934,148 +1303,234 @@ fn handle_waveform_interactions(
                 } else {
                     MarkKind::RegularBeat
                 };
-                let snapped_t = ((t / frame_sec).round() * frame_sec).clamp(0.0, track.duration_sec);
+                let snapped_t =
+                    step_time_by_frames(t, 0, export.frame_rate, track.duration_sec);
                 actions.undo_snapshot = Some(track.clone());
                 let new_id = editing::add_mark(track, snapped_t, kind);
-                wf.selected_mark_id = Some(new_id);
+                wf.select_single(new_id);
                 actions.enable_mark_kind = Some(kind);
                 actions.marks_mutated = true;
             } else if let Some(mid) = hovered_mark_id {
-                wf.selected_mark_id = Some(mid);
-                actions.seek_to = Some(t);
+                if modifiers.shift {
+                    wf.toggle_selected(mid);
+                } else {
+                    wf.select_single(mid);
+                    actions.seek_to = Some(t);
+                }
             } else {
-                wf.selected_mark_id = None;
+                if !modifiers.shift {
+                    wf.clear_selection();
+                }
                 actions.seek_to = Some(t);
             }
         }
-    } else if resp.dragged_by(egui::PointerButton::Primary) {
-        if let Some(pos) = resp.interact_pointer_pos() {
-            let t = x_to_time(pos.x).clamp(0.0, track.duration_sec);
-            actions.seek_to = Some(t);
-        }
     }
 
-    // Right-click context menu on mark or timeline position (persists context_time_sec across frames!)
+    // Right-click context menu on mark(s) or timeline position (persists context_time_sec across frames!)
     if resp.secondary_clicked() {
         wf.context_mark_id = hovered_mark_id;
         wf.context_time_sec = resp
             .interact_pointer_pos()
             .map(|p| x_to_time(p.x).clamp(0.0, track.duration_sec));
         if let Some(mid) = hovered_mark_id {
-            wf.selected_mark_id = Some(mid);
-            wf.label_edit_buf = track
-                .marks
-                .iter()
-                .find(|m| m.id == mid)
-                .and_then(|m| m.custom_label.clone())
-                .unwrap_or_default();
+            if !wf.is_selected(mid) {
+                wf.select_single(mid);
+            }
+            if wf.selected_count() == 1 {
+                wf.label_edit_buf = track
+                    .marks
+                    .iter()
+                    .find(|m| m.id == mid)
+                    .and_then(|m| m.custom_label.clone())
+                    .unwrap_or_default();
+            }
         }
     }
 
     resp.context_menu(|ui| {
         if let Some(mid) = wf.context_mark_id {
-            ui.label(
-                egui::RichText::new("Edit Beat Mark")
-                    .font(brand::font_ui_semibold(12.5))
-                    .color(brand::TEXT),
-            );
-            ui.separator();
-            ui.horizontal(|ui| {
-                if ui.button("◀ -1 Frame").clicked() {
-                    if let Some(cur_t) = track.marks.iter().find(|m| m.id == mid).map(|m| m.time_sec) {
+            let sel_count = wf.selected_count();
+            if sel_count > 1 && wf.is_selected(mid) {
+                // Multi-selection context menu
+                ui.label(
+                    egui::RichText::new(format!("Edit {sel_count} Selected Marks"))
+                        .font(brand::font_ui_semibold(12.5))
+                        .color(brand::TEXT),
+                );
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("◀ -1 Frame").clicked() {
+                        nudge_selection_in_menu(track, &wf.selected_mark_ids, -frame_sec, actions);
+                    }
+                    if ui.button("+1 Frame ▶").clicked() {
+                        nudge_selection_in_menu(track, &wf.selected_mark_ids, frame_sec, actions);
+                    }
+                });
+                ui.separator();
+                for kind in MarkKind::ALL {
+                    if ui
+                        .button(format!("Set All as {}", kind.display_name()))
+                        .clicked()
+                    {
                         actions.undo_snapshot = Some(track.clone());
-                        let snapped = (((cur_t / frame_sec).round() - 1.0) * frame_sec)
-                            .clamp(0.0, track.duration_sec);
-                        editing::move_mark(track, mid, snapped);
+                        let changed = editing::reclassify_marks(track, &wf.selected_mark_ids, kind);
+                        actions.enable_mark_kind = Some(kind);
                         actions.marks_mutated = true;
+                        actions.status_hint = Some(format!(
+                            "Set {changed} selected marks to {}",
+                            kind.short_name()
+                        ));
+                        ui.close_menu();
                     }
                 }
-                if ui.button("+1 Frame ▶").clicked() {
-                    if let Some(cur_t) = track.marks.iter().find(|m| m.id == mid).map(|m| m.time_sec) {
+                ui.separator();
+                if ui.button("Clear Selection").clicked() {
+                    wf.clear_selection();
+                    ui.close_menu();
+                }
+                if ui
+                    .button(
+                        egui::RichText::new(format!("Delete {sel_count} Marks"))
+                            .color(brand::ERROR),
+                    )
+                    .clicked()
+                {
+                    actions.undo_snapshot = Some(track.clone());
+                    let removed = editing::delete_marks(track, &wf.selected_mark_ids);
+                    wf.clear_selection();
+                    wf.context_mark_id = None;
+                    actions.marks_mutated = true;
+                    actions.status_hint = Some(format!("Deleted {removed} selected marks"));
+                    ui.close_menu();
+                }
+            } else {
+                // Single-mark context menu
+                ui.label(
+                    egui::RichText::new("Edit Beat Mark")
+                        .font(brand::font_ui_semibold(12.5))
+                        .color(brand::TEXT),
+                );
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("◀ -1 Frame").clicked() {
+                        if let Some(cur_t) =
+                            track.marks.iter().find(|m| m.id == mid).map(|m| m.time_sec)
+                        {
+                            let snapped = step_time_by_frames(
+                                cur_t,
+                                -1,
+                                export.frame_rate,
+                                track.duration_sec,
+                            );
+                            if (snapped - cur_t).abs() > 1e-9 {
+                                actions.undo_snapshot = Some(track.clone());
+                                editing::move_mark(track, mid, snapped);
+                                actions.marks_mutated = true;
+                            }
+                        }
+                    }
+                    if ui.button("+1 Frame ▶").clicked() {
+                        if let Some(cur_t) =
+                            track.marks.iter().find(|m| m.id == mid).map(|m| m.time_sec)
+                        {
+                            let snapped = step_time_by_frames(
+                                cur_t,
+                                1,
+                                export.frame_rate,
+                                track.duration_sec,
+                            );
+                            if (snapped - cur_t).abs() > 1e-9 {
+                                actions.undo_snapshot = Some(track.clone());
+                                editing::move_mark(track, mid, snapped);
+                                actions.marks_mutated = true;
+                            }
+                        }
+                    }
+                });
+                ui.separator();
+                for kind in MarkKind::ALL {
+                    if ui.button(format!("Set as {}", kind.display_name())).clicked() {
                         actions.undo_snapshot = Some(track.clone());
-                        let snapped = (((cur_t / frame_sec).round() + 1.0) * frame_sec)
-                            .clamp(0.0, track.duration_sec);
-                        editing::move_mark(track, mid, snapped);
+                        editing::reclassify_mark(track, mid, kind);
+                        actions.enable_mark_kind = Some(kind);
                         actions.marks_mutated = true;
+                        ui.close_menu();
                     }
                 }
-            });
-            ui.separator();
-            for kind in MarkKind::ALL {
-                if ui.button(format!("Set as {}", kind.display_name())).clicked() {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("Custom Marker Label")
+                        .size(11.5)
+                        .color(brand::MUTED),
+                );
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut wf.label_edit_buf);
+                    if ui.button("Apply").clicked() {
+                        actions.undo_snapshot = Some(track.clone());
+                        let lbl = if wf.label_edit_buf.trim().is_empty() {
+                            None
+                        } else {
+                            Some(wf.label_edit_buf.trim().to_string())
+                        };
+                        editing::set_mark_label(track, mid, lbl);
+                        actions.marks_mutated = true;
+                        ui.close_menu();
+                    }
+                });
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("Re-Lock Grid From Here")
+                        .size(11.0)
+                        .color(brand::HIGHLIGHT),
+                );
+                if ui
+                    .button("Anchor as Beat 1 (Downbeat) -> End")
+                    .on_hover_text("Keeps earlier marks untouched and re-locks all beats from here to the end starting on Beat 1")
+                    .clicked()
+                {
+                    if let Some(cur_t) =
+                        track.marks.iter().find(|m| m.id == mid).map(|m| m.time_sec)
+                    {
+                        actions.undo_snapshot = Some(track.clone());
+                        editing::relock_grid_from_time(track, cur_t, 1);
+                        wf.clear_selection();
+                        actions.marks_mutated = true;
+                        actions.status_hint = Some(format!(
+                            "Re-locked grid from marker as Beat 1 ({undo_lbl} to undo)"
+                        ));
+                        ui.close_menu();
+                    }
+                }
+                if ui
+                    .button("Anchor as Beat 2 (Clap / Backbeat) -> End")
+                    .on_hover_text("Keeps earlier marks untouched and re-locks all beats from here to the end starting on Beat 2")
+                    .clicked()
+                {
+                    if let Some(cur_t) =
+                        track.marks.iter().find(|m| m.id == mid).map(|m| m.time_sec)
+                    {
+                        actions.undo_snapshot = Some(track.clone());
+                        editing::relock_grid_from_time(track, cur_t, 2);
+                        wf.clear_selection();
+                        actions.marks_mutated = true;
+                        actions.status_hint = Some(format!(
+                            "Re-locked grid from marker as Beat 2 / Clap ({undo_lbl} to undo)"
+                        ));
+                        ui.close_menu();
+                    }
+                }
+                ui.separator();
+                if ui
+                    .button(egui::RichText::new("Delete Mark").color(brand::ERROR))
+                    .clicked()
+                {
                     actions.undo_snapshot = Some(track.clone());
-                    editing::reclassify_mark(track, mid, kind);
+                    editing::delete_mark(track, mid);
+                    wf.clear_selection();
+                    wf.context_mark_id = None;
                     actions.marks_mutated = true;
                     ui.close_menu();
                 }
-            }
-            ui.separator();
-            ui.label(egui::RichText::new("Custom Marker Label").size(11.5).color(brand::MUTED));
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut wf.label_edit_buf);
-                if ui.button("Apply").clicked() {
-                    actions.undo_snapshot = Some(track.clone());
-                    let lbl = if wf.label_edit_buf.trim().is_empty() {
-                        None
-                    } else {
-                        Some(wf.label_edit_buf.trim().to_string())
-                    };
-                    editing::set_mark_label(track, mid, lbl);
-                    actions.marks_mutated = true;
-                    ui.close_menu();
-                }
-            });
-            ui.separator();
-            ui.label(
-                egui::RichText::new("Re-Lock Grid From Here")
-                    .size(11.0)
-                    .color(brand::HIGHLIGHT),
-            );
-            if ui
-                .button("Anchor as Beat 1 (Downbeat) -> End")
-                .on_hover_text("Keeps earlier marks untouched and re-locks all beats from here to the end starting on Beat 1")
-                .clicked()
-            {
-                if let Some(cur_t) = track.marks.iter().find(|m| m.id == mid).map(|m| m.time_sec) {
-                    actions.undo_snapshot = Some(track.clone());
-                    editing::relock_grid_from_time(track, cur_t, 1);
-                    wf.selected_mark_id = None;
-                    actions.marks_mutated = true;
-                    actions.status_hint = Some(format!(
-                        "Re-locked grid from marker as Beat 1 ({}+Z to undo)",
-                        brand::MOD_KEY
-                    ));
-                    ui.close_menu();
-                }
-            }
-            if ui
-                .button("Anchor as Beat 2 (Clap / Backbeat) -> End")
-                .on_hover_text("Keeps earlier marks untouched and re-locks all beats from here to the end starting on Beat 2")
-                .clicked()
-            {
-                if let Some(cur_t) = track.marks.iter().find(|m| m.id == mid).map(|m| m.time_sec) {
-                    actions.undo_snapshot = Some(track.clone());
-                    editing::relock_grid_from_time(track, cur_t, 2);
-                    wf.selected_mark_id = None;
-                    actions.marks_mutated = true;
-                    actions.status_hint = Some(format!(
-                        "Re-locked grid from marker as Beat 2 / Clap ({}+Z to undo)",
-                        brand::MOD_KEY
-                    ));
-                    ui.close_menu();
-                }
-            }
-            ui.separator();
-            if ui
-                .button(egui::RichText::new("Delete Mark").color(brand::ERROR))
-                .clicked()
-            {
-                actions.undo_snapshot = Some(track.clone());
-                editing::delete_mark(track, mid);
-                wf.selected_mark_id = None;
-                wf.context_mark_id = None;
-                actions.marks_mutated = true;
-                ui.close_menu();
             }
         } else if let Some(t) = wf.context_time_sec {
             ui.label(
@@ -1087,14 +1542,24 @@ fn handle_waveform_interactions(
             for kind in MarkKind::ALL {
                 if ui.button(format!("Add {} Here", kind.short_name())).clicked() {
                     let snapped_t =
-                        ((t / frame_sec).round() * frame_sec).clamp(0.0, track.duration_sec);
+                        step_time_by_frames(t, 0, export.frame_rate, track.duration_sec);
                     actions.undo_snapshot = Some(track.clone());
                     let id = editing::add_mark(track, snapped_t, kind);
-                    wf.selected_mark_id = Some(id);
+                    wf.select_single(id);
                     actions.enable_mark_kind = Some(kind);
                     actions.marks_mutated = true;
                     ui.close_menu();
                 }
+            }
+            ui.separator();
+            if ui.button("Select All Visible Marks").clicked() {
+                wf.selected_mark_ids = track
+                    .marks
+                    .iter()
+                    .filter(|m| style.is_mark_included(m))
+                    .map(|m| m.id)
+                    .collect();
+                ui.close_menu();
             }
             ui.separator();
             ui.label(
@@ -1107,14 +1572,13 @@ fn handle_waveform_interactions(
                 .on_hover_text("Keeps earlier marks untouched and re-locks all beats from here to the end starting on Beat 1")
                 .clicked()
             {
-                let snapped_t = ((t / frame_sec).round() * frame_sec).clamp(0.0, track.duration_sec);
+                let snapped_t = step_time_by_frames(t, 0, export.frame_rate, track.duration_sec);
                 actions.undo_snapshot = Some(track.clone());
                 editing::relock_grid_from_time(track, snapped_t, 1);
-                wf.selected_mark_id = None;
+                wf.clear_selection();
                 actions.marks_mutated = true;
                 actions.status_hint = Some(format!(
-                    "Re-locked grid from here as Beat 1 ({}+Z to undo)",
-                    brand::MOD_KEY
+                    "Re-locked grid from here as Beat 1 ({undo_lbl} to undo)"
                 ));
                 ui.close_menu();
             }
@@ -1123,14 +1587,13 @@ fn handle_waveform_interactions(
                 .on_hover_text("Keeps earlier marks untouched and re-locks all beats from here to the end starting on Beat 2")
                 .clicked()
             {
-                let snapped_t = ((t / frame_sec).round() * frame_sec).clamp(0.0, track.duration_sec);
+                let snapped_t = step_time_by_frames(t, 0, export.frame_rate, track.duration_sec);
                 actions.undo_snapshot = Some(track.clone());
                 editing::relock_grid_from_time(track, snapped_t, 2);
-                wf.selected_mark_id = None;
+                wf.clear_selection();
                 actions.marks_mutated = true;
                 actions.status_hint = Some(format!(
-                    "Re-locked grid from here as Beat 2 / Clap ({}+Z to undo)",
-                    brand::MOD_KEY
+                    "Re-locked grid from here as Beat 2 / Clap ({undo_lbl} to undo)"
                 ));
                 ui.close_menu();
             }
@@ -1149,6 +1612,42 @@ fn handle_waveform_interactions(
             }
         }
     });
+}
+
+fn nudge_selection_in_menu(
+    track: &mut TrackAnalysis,
+    selected_ids: &HashSet<u64>,
+    delta_sec: f64,
+    actions: &mut WaveformActions,
+) {
+    let selected_times: Vec<(u64, f64)> = track
+        .marks
+        .iter()
+        .filter(|m| selected_ids.contains(&m.id))
+        .map(|m| (m.id, m.time_sec))
+        .collect();
+    if selected_times.is_empty() {
+        return;
+    }
+    let min_t = selected_times
+        .iter()
+        .map(|&(_, t)| t)
+        .fold(f64::INFINITY, f64::min);
+    let max_t = selected_times
+        .iter()
+        .map(|&(_, t)| t)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let clamped_delta = delta_sec.clamp(-min_t, (track.duration_sec - max_t).max(0.0));
+    if clamped_delta.abs() < 1e-9 {
+        return;
+    }
+    actions.undo_snapshot = Some(track.clone());
+    let updates: Vec<(u64, f64)> = selected_times
+        .into_iter()
+        .map(|(id, t)| (id, t + clamped_delta))
+        .collect();
+    editing::move_marks(track, &updates);
+    actions.marks_mutated = true;
 }
 
 fn dj_rgb_color(low: f32, mid: f32, high: f32, alpha: u8) -> Color32 {

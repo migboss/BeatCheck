@@ -1,10 +1,12 @@
 use crate::brand::{self, StrokeIcon};
 use crate::config::{format_live_smpte, resolve_color32, ResolvePreset, WaveformVisualMode};
 use crate::hud::HudActions;
+use crate::shortcuts::{KeyBindings, ShortcutAction};
 use beatcheck_audio::AudioPlayer;
 use beatcheck_core::model::{GridMode, MarkKind, ResolveColor, TimeSignature, TrackAnalysis};
 use beatcheck_edl::{ExportSettings, FrameRate};
 use egui::{Align, CornerRadius, Frame, Layout, Margin, RichText, ScrollArea, Stroke, Ui, Vec2};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DrawerTab {
@@ -23,6 +25,7 @@ pub struct ExportPanelActions {
     pub open_preview: bool,
     pub save_portable_config: bool,
     pub close_drawer: bool,
+    pub open_shortcuts_page: bool,
     pub select_audio_device: Option<Option<String>>,
     pub reconnect_audio: bool,
     pub test_audio_tone: bool,
@@ -38,12 +41,13 @@ pub fn draw_slide_over_drawer(
     tab: &mut DrawerTab,
     visual_mode: &mut WaveformVisualMode,
     track: Option<&mut TrackAnalysis>,
-    selected_mark_id: Option<u64>,
+    selected_mark_ids: &HashSet<u64>,
     resolved_count: usize,
     can_reset: bool,
     player: &AudioPlayer,
     audio_devices: &[String],
     settings: &mut ExportSettings,
+    shortcuts: &KeyBindings,
     frame_sec: f64,
     export_actions: &mut ExportPanelActions,
     hud_actions: &mut HudActions,
@@ -57,7 +61,10 @@ pub fn draw_slide_over_drawer(
         );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if brand::stroke_button(ui, Some(StrokeIcon::DrawerClose), "", false, 26.0)
-                .on_hover_text("Hide inspector (E)")
+                .on_hover_text(format!(
+                    "Hide inspector ({})",
+                    shortcuts.label(ShortcutAction::ToggleInspector)
+                ))
                 .clicked()
             {
                 export_actions.close_drawer = true;
@@ -127,9 +134,10 @@ pub fn draw_slide_over_drawer(
                     ui,
                     panel_w,
                     track,
-                    selected_mark_id,
+                    selected_mark_ids,
                     can_reset,
                     settings,
+                    shortcuts,
                     frame_sec,
                     hud_actions,
                 ),
@@ -141,6 +149,7 @@ pub fn draw_slide_over_drawer(
                     player,
                     audio_devices,
                     settings,
+                    shortcuts,
                     export_actions,
                 ),
             }
@@ -339,7 +348,7 @@ fn draw_export_tab(
             &format!("Export Marker .edl ({resolved_count})"),
             Vec2::new(panel_w, 38.0),
         )
-        .on_hover_text("CMX 3600 Marker EDL (DaVinci Resolve: Timeline -> Import -> Timeline Markers from EDL...)")
+        .on_hover_text("CMX 3600 Marker EDL (DaVinci Resolve: Right-click your timeline in the Media Pool -> Timelines -> Import -> Timeline Markers from EDL... — do NOT use File -> Import -> Timeline)")
         .clicked()
         {
             actions.export_marker_edl = true;
@@ -412,9 +421,10 @@ fn draw_tune_grid_tab(
     ui: &mut Ui,
     panel_w: f32,
     track: Option<&mut TrackAnalysis>,
-    selected_mark_id: Option<u64>,
+    selected_mark_ids: &HashSet<u64>,
     can_reset: bool,
     export: &ExportSettings,
+    shortcuts: &KeyBindings,
     frame_sec: f64,
     actions: &mut HudActions,
 ) {
@@ -427,7 +437,7 @@ fn draw_tune_grid_tab(
         return;
     };
 
-    // 0. Add Any Beat Marker at Playhead (1-click + keys 1, 2, 3, 4!)
+    // 0. Add Any Beat Marker at Playhead (1-click + configurable shortcuts!)
     ui.label(
         RichText::new("ADD MARKER AT PLAYHEAD")
             .font(brand::font_mono_bold(10.5))
@@ -443,15 +453,18 @@ fn draw_tune_grid_tab(
         .show(ui, |ui| {
             ui.set_width((panel_w - 22.0).max(180.0));
             let pairs = [
-                [(MarkKind::Downbeat, "1"), (MarkKind::StrongBeat, "2")],
-                [(MarkKind::RegularBeat, "3"), (MarkKind::EnergyDrop, "4")],
+                [MarkKind::Downbeat, MarkKind::StrongBeat],
+                [MarkKind::RegularBeat, MarkKind::EnergyDrop],
             ];
             for (ri, row) in pairs.iter().enumerate() {
                 ui.columns(2, |cols| {
-                    for (ci, &(kind, key)) in row.iter().enumerate() {
+                    for (ci, &kind) in row.iter().enumerate() {
                         let dot_col = resolve_color32(export.style.style_for(kind).color);
+                        let action = ShortcutAction::for_mark_kind(kind);
+                        let key_short = shortcuts.short_label(action);
+                        let key_full = shortcuts.label(action);
                         let btn = egui::Button::new(
-                            RichText::new(format!("+ {} ({key})", kind.short_name()))
+                            RichText::new(format!("+ {} ({key_short})", kind.short_name()))
                                 .font(brand::font_ui_semibold(11.5))
                                 .color(brand::TEXT),
                         )
@@ -475,7 +488,7 @@ fn draw_tune_grid_tab(
                         if cols[ci]
                             .add_sized([cols[ci].available_width(), 28.0], btn)
                             .on_hover_text(format!(
-                                "Insert {} at current playhead snapped to exact frame (Shortcut: Key {key})",
+                                "Insert {} at current playhead snapped to exact frame (Shortcut: {key_full})",
                                 kind.display_name()
                             ))
                             .clicked()
@@ -490,9 +503,12 @@ fn draw_tune_grid_tab(
             }
             ui.add_space(4.0);
             ui.label(
-                RichText::new("Tip: Tap keys 1–4 while playing, or right-click anywhere on the waveform.")
-                    .size(10.5)
-                    .color(brand::MUTED),
+                RichText::new(format!(
+                    "Tip: Tap {} while playing, or right-click anywhere on the waveform.",
+                    shortcuts.short_label(ShortcutAction::AddRegularBeat)
+                ))
+                .size(10.5)
+                .color(brand::MUTED),
             );
         });
 
@@ -509,13 +525,17 @@ fn draw_tune_grid_tab(
     );
     ui.add_space(4.0);
 
-    let selected_mark = selected_mark_id.and_then(|id| track.marks.iter().find(|m| m.id == id));
+    let selected_marks: Vec<&beatcheck_core::model::BeatMark> = track
+        .marks
+        .iter()
+        .filter(|m| selected_mark_ids.contains(&m.id))
+        .collect();
 
     Frame::new()
         .fill(brand::SURFACE)
         .stroke(Stroke::new(
             1.0,
-            if selected_mark.is_some() {
+            if !selected_marks.is_empty() {
                 brand::PRIMARY
             } else {
                 brand::BORDER
@@ -525,34 +545,80 @@ fn draw_tune_grid_tab(
         .inner_margin(Margin::same(10))
         .show(ui, |ui| {
             ui.set_width((panel_w - 22.0).max(180.0));
-            if let Some(m) = selected_mark {
-                let tc = format_live_smpte(export.frame_rate, &export.start_timecode, m.time_sec);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new(format!("Bar {}.{} · {}", m.bar, m.beat_in_bar, m.kind.short_name()))
+            if !selected_marks.is_empty() {
+                if selected_marks.len() == 1 {
+                    let m = selected_marks[0];
+                    let smpte_t = export.mark_smpte_offset_sec(m.time_sec, track.in_point_sec);
+                    let tc = format_live_smpte(export.frame_rate, &export.start_timecode, smpte_t);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "Bar {}.{} · {}",
+                                m.bar,
+                                m.beat_in_bar,
+                                m.kind.short_name()
+                            ))
                             .font(brand::font_ui_semibold(12.0))
                             .color(brand::TEXT),
-                    );
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        ui.label(
-                            RichText::new(tc)
-                                .font(brand::font_mono_bold(12.0))
-                                .color(brand::LAVENDER),
                         );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(tc)
+                                    .font(brand::font_mono_bold(12.0))
+                                    .color(brand::LAVENDER),
+                            );
+                        });
                     });
-                });
+                } else {
+                    let first_t = selected_marks
+                        .iter()
+                        .map(|m| export.mark_smpte_offset_sec(m.time_sec, track.in_point_sec))
+                        .fold(f64::INFINITY, f64::min);
+                    let last_t = selected_marks
+                        .iter()
+                        .map(|m| export.mark_smpte_offset_sec(m.time_sec, track.in_point_sec))
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    let tc0 =
+                        format_live_smpte(export.frame_rate, &export.start_timecode, first_t);
+                    let tc1 = format_live_smpte(export.frame_rate, &export.start_timecode, last_t);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("{} marks selected", selected_marks.len()))
+                                .font(brand::font_ui_semibold(12.0))
+                                .color(brand::TEXT),
+                        );
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(
+                                RichText::new(format!("{tc0}–{tc1}"))
+                                    .font(brand::font_mono_bold(10.5))
+                                    .color(brand::LAVENDER),
+                            );
+                        });
+                    });
+                }
                 ui.add_space(6.0);
+                let del_label = if selected_marks.len() > 1 {
+                    format!("Delete ({})", selected_marks.len())
+                } else {
+                    "Delete".to_string()
+                };
                 ui.columns(3, |cols| {
                     if cols[0]
                         .add_sized([cols[0].available_width(), 28.0], egui::Button::new("◀ -1f"))
-                        .on_hover_text("Move marker 1 frame earlier (,)")
+                        .on_hover_text(format!(
+                            "Move selected marker(s) 1 frame earlier ({})",
+                            shortcuts.label(ShortcutAction::NudgeMarkBack)
+                        ))
                         .clicked()
                     {
                         actions.nudge_selected_frames = Some(-1);
                     }
                     if cols[1]
                         .add_sized([cols[1].available_width(), 28.0], egui::Button::new("+1f ▶"))
-                        .on_hover_text("Move marker 1 frame later (.)")
+                        .on_hover_text(format!(
+                            "Move selected marker(s) 1 frame later ({})",
+                            shortcuts.label(ShortcutAction::NudgeMarkForward)
+                        ))
                         .clicked()
                     {
                         actions.nudge_selected_frames = Some(1);
@@ -560,8 +626,12 @@ fn draw_tune_grid_tab(
                     if cols[2]
                         .add_sized(
                             [cols[2].available_width(), 28.0],
-                            egui::Button::new(RichText::new("Delete").color(brand::ERROR)),
+                            egui::Button::new(RichText::new(del_label).color(brand::ERROR)),
                         )
+                        .on_hover_text(format!(
+                            "Delete selected marker(s) ({})",
+                            shortcuts.label(ShortcutAction::DeleteSelectedMark)
+                        ))
                         .clicked()
                     {
                         actions.delete_selected_mark = true;
@@ -569,7 +639,7 @@ fn draw_tune_grid_tab(
                 });
             } else {
                 ui.label(
-                    RichText::new("Click any beat line on the waveform to select it, or drag it to snap frame-by-frame.")
+                    RichText::new("Click a beat line to select it, Shift+Click to toggle, or drag a box across the waveform to select multiple markers.")
                         .size(11.5)
                         .color(brand::MUTED),
                 );
@@ -622,7 +692,13 @@ fn draw_tune_grid_tab(
                     actions.bpm_multiplier = Some(2.0);
                 }
                 if cols[2]
-                    .add_sized([cols[2].available_width(), 28.0], egui::Button::new("Tap (T)"))
+                    .add_sized(
+                        [cols[2].available_width(), 28.0],
+                        egui::Button::new(format!(
+                            "Tap ({})",
+                            shortcuts.short_label(ShortcutAction::TapTempo)
+                        )),
+                    )
                     .clicked()
                 {
                     actions.tap_tempo = true;
@@ -774,8 +850,8 @@ fn draw_tune_grid_tab(
             30.0,
         )
         .on_hover_text(format!(
-            "Restore original detected marks & BPM (undoable with {}+Z)",
-            brand::MOD_KEY
+            "Restore original detected marks & BPM (undoable with {})",
+            shortcuts.short_label(ShortcutAction::Undo)
         ))
         .clicked()
         {
@@ -786,6 +862,7 @@ fn draw_tune_grid_tab(
 
 /// New Settings Tab: Audio Output Device & Diagnostics, Export Range & Offsets,
 /// Full 16-Color Resolve Marker Customization, and Portable Defaults.
+#[allow(clippy::too_many_arguments)]
 fn draw_settings_tab(
     ui: &mut Ui,
     panel_w: f32,
@@ -794,6 +871,7 @@ fn draw_settings_tab(
     player: &AudioPlayer,
     audio_devices: &[String],
     settings: &mut ExportSettings,
+    shortcuts: &KeyBindings,
     actions: &mut ExportPanelActions,
 ) {
     // 0. Waveform Display Mode (3 modes: Outline | HD Solid | RGB Bands)
@@ -1072,15 +1150,64 @@ fn draw_settings_tab(
         ui.add_space(4.0);
     }
 
+    ui.add_space(12.0);
+
+    // 4. Keyboard Shortcuts Entry Point
+    ui.label(
+        RichText::new("KEYBOARD SHORTCUTS")
+            .font(brand::font_mono_bold(10.5))
+            .color(brand::HIGHLIGHT),
+    );
+    ui.add_space(4.0);
+
+    Frame::new()
+        .fill(brand::SURFACE)
+        .stroke(Stroke::new(1.0, brand::BORDER))
+        .corner_radius(CornerRadius::same(10))
+        .inner_margin(Margin::same(10))
+        .show(ui, |ui| {
+            ui.set_width((panel_w - 22.0).max(180.0));
+            let custom_count = ShortcutAction::ALL
+                .iter()
+                .filter(|&&a| shortcuts.is_action_modified(a))
+                .count();
+            let desc = if custom_count == 0 {
+                "Rebind playback, marker placement, frame stepping & editing keys.".to_string()
+            } else {
+                format!("{custom_count} customized shortcut(s) active.")
+            };
+            ui.label(RichText::new(desc).size(11.0).color(brand::MUTED));
+            ui.add_space(6.0);
+            if brand::stroke_button(
+                ui,
+                Some(StrokeIcon::Keyboard),
+                "Customize Keyboard Shortcuts",
+                false,
+                28.0,
+            )
+            .clicked()
+            {
+                actions.open_shortcuts_page = true;
+            }
+        });
+
     ui.add_space(10.0);
+    ui.label(
+        RichText::new("Preferences & shortcuts auto-save to beatcheck.toml beside BeatCheck.")
+            .size(10.5)
+            .color(brand::MUTED),
+    );
+    ui.add_space(4.0);
     if brand::stroke_button(
         ui,
         Some(StrokeIcon::Save),
-        "Save Defaults to beatcheck.toml",
+        "Save Preferences Now",
         false,
         30.0,
     )
-    .on_hover_text("Saves FPS, Start TC, colors & audio volumes right beside the executable")
+    .on_hover_text(
+        "Immediately writes Click, Outline/RGB, Tape/Page, FPS, colors, volumes & shortcuts to beatcheck.toml",
+    )
     .clicked()
     {
         actions.save_portable_config = true;

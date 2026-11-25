@@ -2,6 +2,7 @@ use crate::brand::{self, StrokeIcon};
 use crate::config::{
     format_live_smpte, format_mm_ss, mark_color32, resolve_color32, ScrollMode, WaveformVisualMode,
 };
+use crate::shortcuts::{KeyBindings, ShortcutAction};
 use beatcheck_audio::AudioPlayer;
 use beatcheck_core::model::{GridMode, MarkExportStyle, MarkKind, TimeSignature, TrackAnalysis};
 use beatcheck_edl::ExportSettings;
@@ -9,6 +10,7 @@ use egui::{
     Align, Color32, CornerRadius, Frame, Layout, Margin, RichText, Sense, Stroke, StrokeKind, Ui,
     Vec2,
 };
+use std::collections::HashSet;
 
 #[derive(Debug, Default)]
 pub struct HudActions {
@@ -21,7 +23,9 @@ pub struct HudActions {
     pub nudge_sec: Option<f64>,
     pub nudge_selected_frames: Option<i32>,
     pub add_mark_at_playhead: Option<MarkKind>,
+    pub reclassify_selected_marks: Option<MarkKind>,
     pub delete_selected_mark: bool,
+    pub clear_selection: bool,
     pub reset_to_auto: bool,
     pub mark_filter_changed: bool,
     pub tap_tempo: bool,
@@ -34,6 +38,7 @@ pub struct HudActions {
     pub rewind_to_start: bool,
     pub jump_downbeat: Option<i32>,
     pub toggle_drawer: bool,
+    pub toggle_shortcuts_page: bool,
 }
 
 /// Clean, overlap-free Top Brand HUD.
@@ -43,9 +48,11 @@ pub fn draw_top_hud(
     ui: &mut Ui,
     track: Option<&mut TrackAnalysis>,
     export: &ExportSettings,
+    shortcuts: &KeyBindings,
     playhead_sec: f64,
     is_playing: bool,
     drawer_open: bool,
+    shortcuts_page_open: bool,
     resolved_count: usize,
     actions: &mut HudActions,
 ) {
@@ -59,8 +66,8 @@ pub fn draw_top_hud(
         ui.add_space(2.0);
         if brand::stroke_button(ui, Some(StrokeIcon::Folder), "Open", false, 28.0)
             .on_hover_text(format!(
-                "Import MP3, WAV, FLAC, OGG, or M4A ({}+O) — or drag & drop anywhere",
-                brand::MOD_KEY
+                "Import MP3, WAV, FLAC, OGG, or M4A ({}) — or drag & drop anywhere",
+                shortcuts.label(ShortcutAction::OpenFile)
             ))
             .clicked()
         {
@@ -69,7 +76,7 @@ pub fn draw_top_hud(
 
         let Some(track) = track else {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.spacing_mut().item_spacing.x = 8.0;
                 let inspector_btn = brand::stroke_button(
                     ui,
                     Some(if drawer_open {
@@ -82,10 +89,25 @@ pub fn draw_top_hud(
                     28.0,
                 );
                 if inspector_btn
-                    .on_hover_text("Show or hide the Timeline Inspector panel (E)")
+                    .on_hover_text(format!(
+                        "Show or hide the Timeline Inspector panel ({})",
+                        shortcuts.label(ShortcutAction::ToggleInspector)
+                    ))
                     .clicked()
                 {
                     actions.toggle_drawer = true;
+                }
+                if brand::stroke_button(
+                    ui,
+                    Some(StrokeIcon::Keyboard),
+                    "Shortcuts",
+                    shortcuts_page_open,
+                    28.0,
+                )
+                .on_hover_text("View and customize keyboard shortcuts")
+                .clicked()
+                {
+                    actions.toggle_shortcuts_page = true;
                 }
                 ui.label(
                     RichText::new(brand::BRAND_TAGLINE)
@@ -150,7 +172,10 @@ pub fn draw_top_hud(
             });
 
         if brand::stroke_button(ui, None, "Tap", false, 26.0)
-            .on_hover_text("Tap tempo repeatedly with the music (shortcut: T)")
+            .on_hover_text(format!(
+                "Tap tempo repeatedly with the music (shortcut: {})",
+                shortcuts.label(ShortcutAction::TapTempo)
+            ))
             .clicked()
         {
             actions.tap_tempo = true;
@@ -178,15 +203,37 @@ pub fn draw_top_hud(
         // Live Flashing Beat Pips [1][2][3][4] + Bar:Beat Readout
         draw_live_beat_pips(ui, track, &export.style, playhead_sec, is_playing);
 
-        // Right-aligned ONLY when cursor genuinely has >= 330px remaining on this line!
+        // Right-aligned ONLY when cursor genuinely has >= 380px remaining on this line!
         let remaining_x = (ui.max_rect().right() - ui.cursor().left()).max(0.0);
-        if remaining_x >= 330.0 {
+        if remaining_x >= 380.0 {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                draw_top_hud_right(ui, track, export, playhead_sec, drawer_open, resolved_count, actions, true);
+                draw_top_hud_right(
+                    ui,
+                    track,
+                    export,
+                    shortcuts,
+                    playhead_sec,
+                    drawer_open,
+                    shortcuts_page_open,
+                    resolved_count,
+                    actions,
+                    true,
+                );
             });
         } else {
             draw_hairline_sep(ui);
-            draw_top_hud_right(ui, track, export, playhead_sec, drawer_open, resolved_count, actions, false);
+            draw_top_hud_right(
+                ui,
+                track,
+                export,
+                shortcuts,
+                playhead_sec,
+                drawer_open,
+                shortcuts_page_open,
+                resolved_count,
+                actions,
+                false,
+            );
         }
     });
 }
@@ -196,8 +243,10 @@ fn draw_top_hud_right(
     ui: &mut Ui,
     track: &TrackAnalysis,
     export: &ExportSettings,
+    shortcuts: &KeyBindings,
     playhead_sec: f64,
     drawer_open: bool,
+    shortcuts_page_open: bool,
     resolved_count: usize,
     actions: &mut HudActions,
     rtl: bool,
@@ -227,15 +276,34 @@ fn draw_top_hud_right(
             )
         };
         if drawer_btn
-            .on_hover_text("Show or hide the Timeline Inspector panel (E)")
+            .on_hover_text(format!(
+                "Show or hide the Timeline Inspector panel ({})",
+                shortcuts.label(ShortcutAction::ToggleInspector)
+            ))
             .clicked()
         {
             actions.toggle_drawer = true;
         }
     };
 
+    let draw_keys_btn = |ui: &mut Ui, actions: &mut HudActions| {
+        if brand::stroke_button(
+            ui,
+            Some(StrokeIcon::Keyboard),
+            "",
+            shortcuts_page_open,
+            28.0,
+        )
+        .on_hover_text("Keyboard Shortcuts — view & customize keybindings")
+        .clicked()
+        {
+            actions.toggle_shortcuts_page = true;
+        }
+    };
+
     if rtl {
         draw_toggle(ui, actions);
+        draw_keys_btn(ui, actions);
         draw_hairline_sep(ui);
         ui.label(
             RichText::new(dur_str)
@@ -263,6 +331,7 @@ fn draw_top_hud_right(
                 .font(brand::font_mono_bold(14.5))
                 .color(brand::LAVENDER),
         );
+        draw_keys_btn(ui, actions);
         draw_toggle(ui, actions);
     }
 }
@@ -372,7 +441,8 @@ pub fn draw_waveform_toolbar(
     ui: &mut Ui,
     track: &mut TrackAnalysis,
     export: &mut ExportSettings,
-    selected_mark_id: Option<u64>,
+    shortcuts: &KeyBindings,
+    selected_mark_ids: &HashSet<u64>,
     visual_mode: &mut WaveformVisualMode,
     scroll_mode: &mut ScrollMode,
     can_undo: bool,
@@ -428,7 +498,10 @@ pub fn draw_waveform_toolbar(
         // 2. Undo / Redo / Reset to Algorithm
         ui.add_enabled_ui(can_undo, |ui| {
             if brand::stroke_button(ui, Some(StrokeIcon::Undo), "", false, 26.0)
-                .on_hover_text(format!("Undo last edit ({}+Z)", brand::MOD_KEY))
+                .on_hover_text(format!(
+                    "Undo last edit ({})",
+                    shortcuts.label(ShortcutAction::Undo)
+                ))
                 .clicked()
             {
                 actions.undo = true;
@@ -436,7 +509,7 @@ pub fn draw_waveform_toolbar(
         });
         ui.add_enabled_ui(can_redo, |ui| {
             if brand::stroke_button(ui, Some(StrokeIcon::Redo), "", false, 26.0)
-                .on_hover_text(format!("Redo ({})", brand::REDO_SHORTCUT))
+                .on_hover_text(format!("Redo ({})", shortcuts.label(ShortcutAction::Redo)))
                 .clicked()
             {
                 actions.redo = true;
@@ -445,8 +518,8 @@ pub fn draw_waveform_toolbar(
         ui.add_enabled_ui(can_reset, |ui| {
             if brand::stroke_button(ui, Some(StrokeIcon::Reset), "Reset", false, 26.0)
                 .on_hover_text(format!(
-                    "Reset all manual changes back to what the algorithm originally marked ({}+Z undoable)",
-                    brand::MOD_KEY
+                    "Reset all manual changes back to what the algorithm originally marked ({} undoable)",
+                    shortcuts.short_label(ShortcutAction::Undo)
                 ))
                 .clicked()
             {
@@ -466,14 +539,14 @@ pub fn draw_waveform_toolbar(
                         .color(brand::HIGHLIGHT),
                 );
                 ui.separator();
-                for (idx, kind) in MarkKind::ALL.into_iter().enumerate() {
+                for kind in MarkKind::ALL {
                     let dot_col = resolve_color32(export.style.style_for(kind).color);
-                    let key_num = idx + 1;
+                    let key_hint = shortcuts.label(ShortcutAction::for_mark_kind(kind));
                     ui.horizontal(|ui| {
                         let (r, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
                         ui.painter().circle_filled(r.center(), 4.5, dot_col);
                         if ui
-                            .button(format!("{}  (Key {})", kind.display_name(), key_num))
+                            .button(format!("{}  ({key_hint})", kind.display_name()))
                             .clicked()
                         {
                             actions.add_mark_at_playhead = Some(kind);
@@ -484,7 +557,13 @@ pub fn draw_waveform_toolbar(
             },
         )
         .response
-        .on_hover_text("Drop any beat marker type at the playhead (Shortcuts: keys 1, 2, 3, 4)");
+        .on_hover_text(format!(
+            "Drop any beat marker type at the playhead (Shortcuts: {}, {}, {}, {})",
+            shortcuts.short_label(ShortcutAction::AddRegularBeat),
+            shortcuts.short_label(ShortcutAction::AddDownbeat),
+            shortcuts.short_label(ShortcutAction::AddStrongBeat),
+            shortcuts.short_label(ShortcutAction::AddEnergyDrop),
+        ));
 
         // 3. View & Zoom group: pure left-to-right flow inside horizontal_wrapped -> 100% IMPOSSIBLE to overlap!
         draw_hairline_sep(ui);
@@ -560,63 +639,196 @@ pub fn draw_waveform_toolbar(
         }
     });
 
-    // Row 2 (Contextual): Dedicated Selected Marker 1-Frame Nudge Bar — zero overlap ever!
-    if let Some(sel_id) = selected_mark_id {
-        if let Some(m) = track.marks.iter().find(|m| m.id == sel_id) {
-            ui.add_space(5.0);
-            let tc = format_live_smpte(export.frame_rate, &export.start_timecode, m.time_sec);
-            let mcol = mark_color32(&export.style, m.kind);
-            Frame::new()
-                .fill(brand::primary_tint(24))
-                .stroke(Stroke::new(1.0, brand::primary_tint(160)))
-                .corner_radius(CornerRadius::same(8))
-                .inner_margin(Margin::symmetric(10, 5))
-                .show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing = Vec2::new(8.0, 4.0);
-                        let (dr, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
-                        ui.painter().circle_filled(dr.center(), 4.5, mcol);
+    // Row 2 (Permanent zero-jump contextual bar): always occupies the same height so selecting
+    // markers while dragging never shifts the waveform down or interrupts mouse gestures!
+    let selected_marks: Vec<&beatcheck_core::model::BeatMark> = if selected_mark_ids.is_empty() {
+        Vec::new()
+    } else {
+        track
+            .marks
+            .iter()
+            .filter(|m| selected_mark_ids.contains(&m.id))
+            .collect()
+    };
+    let has_sel = !selected_marks.is_empty();
+    ui.add_space(5.0);
+    Frame::new()
+        .fill(if has_sel {
+            brand::primary_tint(24)
+        } else {
+            brand::PANEL
+        })
+        .stroke(Stroke::new(
+            1.0,
+            if has_sel {
+                brand::primary_tint(160)
+            } else {
+                brand::BORDER
+            },
+        ))
+        .corner_radius(CornerRadius::same(8))
+        .inner_margin(Margin::symmetric(10, 4))
+        .show(ui, |ui| {
+            ui.set_min_height(24.0);
+            ui.set_width((ui.available_width()).max(120.0));
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(8.0, 4.0);
 
-                        ui.label(
-                            RichText::new(format!(
-                                "Selected: Bar {}.{} · {}",
-                                m.bar,
-                                m.beat_in_bar,
-                                m.kind.display_name()
-                            ))
+                if !has_sel {
+                    ui.label(
+                        RichText::new(format!(
+                            "Drag across waveform to box-select visible markers  ·  Shift+Click to toggle  ·  {}: Select all  ·  Drag top bar to scrub",
+                            shortcuts.short_label(ShortcutAction::SelectAllMarks)
+                        ))
+                        .size(11.0)
+                        .color(brand::MUTED),
+                    );
+                    return;
+                }
+
+                if selected_marks.len() == 1 {
+                    let m = selected_marks[0];
+                    let smpte_t = export.mark_smpte_offset_sec(m.time_sec, track.in_point_sec);
+                    let tc = format_live_smpte(export.frame_rate, &export.start_timecode, smpte_t);
+                    let mcol = mark_color32(&export.style, m.kind);
+                    let (dr, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
+                    ui.painter().circle_filled(dr.center(), 4.5, mcol);
+
+                    ui.label(
+                        RichText::new(format!(
+                            "Selected: Bar {}.{} · {}",
+                            m.bar,
+                            m.beat_in_bar,
+                            m.kind.display_name()
+                        ))
+                        .font(brand::font_ui_semibold(12.0))
+                        .color(brand::TEXT),
+                    );
+                    ui.label(
+                        RichText::new(tc)
+                            .font(brand::font_mono_bold(12.0))
+                            .color(brand::LAVENDER),
+                    );
+                } else {
+                    let first_t = selected_marks
+                        .iter()
+                        .map(|m| export.mark_smpte_offset_sec(m.time_sec, track.in_point_sec))
+                        .fold(f64::INFINITY, f64::min);
+                    let last_t = selected_marks
+                        .iter()
+                        .map(|m| export.mark_smpte_offset_sec(m.time_sec, track.in_point_sec))
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    let tc0 = format_live_smpte(
+                        export.frame_rate,
+                        &export.start_timecode,
+                        first_t,
+                    );
+                    let tc1 = format_live_smpte(
+                        export.frame_rate,
+                        &export.start_timecode,
+                        last_t,
+                    );
+                    let (dr, _) = ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
+                    ui.painter().circle_filled(dr.center(), 4.5, brand::HIGHLIGHT);
+
+                    ui.label(
+                        RichText::new(format!("Selected: {} marks", selected_marks.len()))
                             .font(brand::font_ui_semibold(12.0))
                             .color(brand::TEXT),
-                        );
-                        ui.label(
-                            RichText::new(tc)
-                                .font(brand::font_mono_bold(12.0))
-                                .color(brand::LAVENDER),
-                        );
+                    );
+                    ui.label(
+                        RichText::new(format!("{tc0} – {tc1}"))
+                            .font(brand::font_mono_bold(11.5))
+                            .color(brand::LAVENDER),
+                    );
+                }
 
-                        draw_hairline_sep(ui);
+                draw_hairline_sep(ui);
 
-                        if brand::stroke_button(ui, Some(StrokeIcon::PrevBar), "-1 Frame (,)", false, 24.0)
-                            .on_hover_text("Move selected marker earlier by 1 frame (shortcut: , or [)")
-                            .clicked()
-                        {
-                            actions.nudge_selected_frames = Some(-1);
-                        }
-                        if brand::stroke_button(ui, Some(StrokeIcon::NextBar), "+1 Frame (.)", false, 24.0)
-                            .on_hover_text("Move selected marker later by 1 frame (shortcut: . or ])")
-                            .clicked()
-                        {
-                            actions.nudge_selected_frames = Some(1);
-                        }
-                        if brand::stroke_button(ui, Some(StrokeIcon::Trash), "Delete", false, 24.0)
-                            .on_hover_text("Delete selected marker (Delete)")
-                            .clicked()
-                        {
-                            actions.delete_selected_mark = true;
-                        }
-                    });
-                });
-        }
-    }
+                let back_short = shortcuts.short_label(ShortcutAction::NudgeMarkBack);
+                let fwd_short = shortcuts.short_label(ShortcutAction::NudgeMarkForward);
+                if brand::stroke_button(
+                    ui,
+                    Some(StrokeIcon::PrevBar),
+                    &format!("-1f ({back_short})"),
+                    false,
+                    24.0,
+                )
+                .on_hover_text(format!(
+                    "Move selected marker(s) earlier by 1 frame (shortcut: {})",
+                    shortcuts.label(ShortcutAction::NudgeMarkBack)
+                ))
+                .clicked()
+                {
+                    actions.nudge_selected_frames = Some(-1);
+                }
+                if brand::stroke_button(
+                    ui,
+                    Some(StrokeIcon::NextBar),
+                    &format!("+1f ({fwd_short})"),
+                    false,
+                    24.0,
+                )
+                .on_hover_text(format!(
+                    "Move selected marker(s) later by 1 frame (shortcut: {})",
+                    shortcuts.label(ShortcutAction::NudgeMarkForward)
+                ))
+                .clicked()
+                {
+                    actions.nudge_selected_frames = Some(1);
+                }
+
+                if selected_marks.len() > 1 {
+                    ui.menu_button(
+                        RichText::new("Set Type")
+                            .font(brand::font_ui_semibold(11.5))
+                            .color(brand::LAVENDER),
+                        |ui| {
+                            for kind in MarkKind::ALL {
+                                let dot_col = resolve_color32(export.style.style_for(kind).color);
+                                ui.horizontal(|ui| {
+                                    let (r, _) =
+                                        ui.allocate_exact_size(Vec2::splat(9.0), Sense::hover());
+                                    ui.painter().circle_filled(r.center(), 4.5, dot_col);
+                                    if ui.button(kind.display_name()).clicked() {
+                                        actions.reclassify_selected_marks = Some(kind);
+                                        ui.close_menu();
+                                    }
+                                });
+                            }
+                        },
+                    )
+                    .response
+                    .on_hover_text("Change the marker type of all selected markers");
+                }
+
+                let del_label = if selected_marks.len() > 1 {
+                    format!("Delete ({})", selected_marks.len())
+                } else {
+                    "Delete".to_string()
+                };
+                if brand::stroke_button(ui, Some(StrokeIcon::Trash), &del_label, false, 24.0)
+                    .on_hover_text(format!(
+                        "Delete selected marker(s) ({})",
+                        shortcuts.label(ShortcutAction::DeleteSelectedMark)
+                    ))
+                    .clicked()
+                {
+                    actions.delete_selected_mark = true;
+                }
+
+                if selected_marks.len() > 1
+                    && brand::stroke_button(ui, None, "Clear", false, 24.0)
+                        .on_hover_text(format!(
+                            "Clear selection ({})",
+                            shortcuts.label(ShortcutAction::DeselectMark)
+                        ))
+                        .clicked()
+                {
+                    actions.clear_selection = true;
+                }
+            });
+        });
 }
 
 fn draw_beat_filter_pill(ui: &mut Ui, label: &str, dot_col: Color32, enabled: bool) -> egui::Response {
@@ -669,6 +881,7 @@ fn draw_beat_filter_pill(ui: &mut Ui, label: &str, dot_col: Color32, enabled: bo
 pub fn draw_transport_bar(
     ui: &mut Ui,
     player: &AudioPlayer,
+    shortcuts: &KeyBindings,
     has_track: bool,
     status_message: Option<&(String, bool)>,
     actions: &mut HudActions,
@@ -678,13 +891,19 @@ pub fn draw_transport_bar(
 
         ui.add_enabled_ui(has_track, |ui| {
             if brand::stroke_button(ui, Some(StrokeIcon::Rewind), "", false, 30.0)
-                .on_hover_text("Rewind to Start (Home)")
+                .on_hover_text(format!(
+                    "Rewind to Start ({})",
+                    shortcuts.label(ShortcutAction::RewindToStart)
+                ))
                 .clicked()
             {
                 actions.rewind_to_start = true;
             }
             if brand::stroke_button(ui, Some(StrokeIcon::PrevBar), "Bar", false, 30.0)
-                .on_hover_text("Jump to previous Downbeat (Left Arrow)")
+                .on_hover_text(format!(
+                    "Jump to previous Downbeat ({})",
+                    shortcuts.label(ShortcutAction::PrevDownbeat)
+                ))
                 .clicked()
             {
                 actions.jump_downbeat = Some(-1);
@@ -697,14 +916,20 @@ pub fn draw_transport_bar(
                 if playing { "Pause" } else { "Play" },
                 Vec2::new(88.0, 32.0),
             )
-            .on_hover_text("Play / Pause (Space)")
+            .on_hover_text(format!(
+                "Play / Pause ({})",
+                shortcuts.label(ShortcutAction::PlayPause)
+            ))
             .clicked()
             {
                 player.toggle_play();
             }
 
             if brand::stroke_button(ui, Some(StrokeIcon::NextBar), "Bar", false, 30.0)
-                .on_hover_text("Jump to next Downbeat (Right Arrow)")
+                .on_hover_text(format!(
+                    "Jump to next Downbeat ({})",
+                    shortcuts.label(ShortcutAction::NextDownbeat)
+                ))
                 .clicked()
             {
                 actions.jump_downbeat = Some(1);
@@ -720,7 +945,10 @@ pub fn draw_transport_bar(
                 met_on,
                 30.0,
             )
-            .on_hover_text("Audible sample-accurate metronome click locked to visible beats (M)")
+            .on_hover_text(format!(
+                "Audible sample-accurate metronome click locked to visible beats ({})",
+                shortcuts.label(ShortcutAction::ToggleMetronome)
+            ))
             .clicked()
             {
                 player.set_metronome_enabled(!met_on);
@@ -739,7 +967,10 @@ pub fn draw_transport_bar(
 
             let loop_on = player.loop_enabled();
             if brand::stroke_button(ui, Some(StrokeIcon::Loop), "Loop", loop_on, 30.0)
-                .on_hover_text("Loop between In and Out brackets (L)")
+                .on_hover_text(format!(
+                    "Loop between In and Out brackets ({})",
+                    shortcuts.label(ShortcutAction::ToggleLoop)
+                ))
                 .clicked()
             {
                 player.set_loop_enabled(!loop_on);
@@ -795,8 +1026,14 @@ pub fn draw_transport_bar(
         } else if has_track {
             ui.label(
                 RichText::new(format!(
-                    "Drag mark: ±1f snap  ·  1–4: Add mark  ·  ,/.: Nudge  ·  {}+Z: Undo",
-                    brand::MOD_KEY
+                    "{}: Add mark  ·  {}/{}: ±1f playhead  ·  {}/{}: Nudge mark  ·  {}: Click  ·  {}: Undo",
+                    shortcuts.short_label(ShortcutAction::AddRegularBeat),
+                    shortcuts.short_label(ShortcutAction::StepFrameBack),
+                    shortcuts.short_label(ShortcutAction::StepFrameForward),
+                    shortcuts.short_label(ShortcutAction::NudgeMarkBack),
+                    shortcuts.short_label(ShortcutAction::NudgeMarkForward),
+                    shortcuts.short_label(ShortcutAction::ToggleMetronome),
+                    shortcuts.short_label(ShortcutAction::Undo),
                 ))
                 .size(11.0)
                 .color(brand::MUTED),

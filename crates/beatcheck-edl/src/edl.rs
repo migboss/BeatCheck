@@ -23,6 +23,46 @@ pub struct ExportSettings {
     pub style: MarkExportStyle,
 }
 
+impl ExportSettings {
+    /// Active timeline origin in track seconds (`in_point_sec` when rebasing In-point to Start TC, else `0.0`).
+    pub fn export_origin_sec(&self, in_point_sec: f64) -> f64 {
+        if self.respect_in_out_range && self.rebase_in_point_to_start {
+            in_point_sec
+        } else {
+            0.0
+        }
+    }
+
+    /// Compute the exact video-frame-quantized timestamp (in track seconds) where a mark
+    /// sits on the timeline, including Cut Anticipation.
+    /// Marks strictly before a rebased In-point keep their natural quantized track position
+    /// rather than piling up on `in_point_sec`.
+    pub fn quantized_mark_time_sec(&self, mark_time_sec: f64, in_point_sec: f64) -> f64 {
+        let origin_sec = self.export_origin_sec(in_point_sec);
+        let shifted_sec = (mark_time_sec - origin_sec) + (self.anticipation_ms / 1000.0);
+        let raw_rel_frames =
+            self.frame_rate.seconds_to_frames(shifted_sec) + self.anticipation_frames;
+        let rel_frames = if mark_time_sec + 1e-4 >= origin_sec {
+            raw_rel_frames.max(0)
+        } else {
+            raw_rel_frames
+        };
+        (origin_sec + self.frame_rate.frames_to_seconds(rel_frames)).max(0.0)
+    }
+
+    /// Compute the elapsed seconds from `start_timecode` for displaying a mark's exported SMPTE
+    /// (matches `resolve_markers` even when `rebase_in_point_to_start` is enabled).
+    pub fn mark_smpte_offset_sec(&self, mark_time_sec: f64, in_point_sec: f64) -> f64 {
+        let origin_sec = self.export_origin_sec(in_point_sec);
+        let disp_t = self.quantized_mark_time_sec(mark_time_sec, in_point_sec);
+        if origin_sec > 0.0 && mark_time_sec + 1e-4 >= origin_sec {
+            (disp_t - origin_sec).max(0.0)
+        } else {
+            disp_t
+        }
+    }
+}
+
 impl Default for ExportSettings {
     fn default() -> Self {
         Self {
@@ -80,8 +120,9 @@ pub fn resolve_markers(
 
         let shifted_sec = (mark.time_sec - origin_sec) + (settings.anticipation_ms / 1000.0);
         let rel_frames =
-            settings.frame_rate.seconds_to_frames(shifted_sec) + settings.anticipation_frames;
-        let abs_frame = (start_frame as i64 + rel_frames).max(0) as u64;
+            (settings.frame_rate.seconds_to_frames(shifted_sec) + settings.anticipation_frames)
+                .max(0);
+        let abs_frame = start_frame + rel_frames as u64;
 
         let color = settings.style.style_for(mark.kind).color;
         let label = settings.style.render_label(mark, track.active_bpm);
@@ -117,7 +158,7 @@ pub fn resolve_markers(
 }
 
 /// Export DaVinci Resolve CMX 3600 Timeline Markers EDL.
-/// Import in Resolve via: Timeline -> Import -> Timeline Markers from EDL...
+/// Import in Resolve via: Media Pool -> right-click timeline -> Timelines -> Import -> Timeline Markers from EDL...
 pub fn export_resolve_marker_edl(
     track: &TrackAnalysis,
     settings: &ExportSettings,
@@ -339,5 +380,45 @@ mod tests {
         assert!(edl.contains("001  BL       V     C"));
         assert!(edl.contains("01:00:00:00 01:00:00:13"));
         assert!(edl.contains("01:00:00:13 01:00:01:00"));
+    }
+
+    #[test]
+    fn quantized_mark_time_matches_exported_marker_frame() {
+        let track = sample_track();
+        let mut settings = ExportSettings::default(); // 25 fps, 01:00:00:00
+        settings.anticipation_frames = -1;
+        settings.anticipation_ms = 5.0;
+        let resolved = resolve_markers(&track, &settings).unwrap();
+        let start_frame = settings.frame_rate.parse_smpte(&settings.start_timecode).unwrap();
+        for rm in &resolved {
+            let disp_t = settings.quantized_mark_time_sec(rm.time_sec, track.in_point_sec);
+            let disp_frame = start_frame + settings.frame_rate.seconds_to_frames(disp_t).max(0) as u64;
+            assert_eq!(disp_frame, rm.frame_index);
+        }
+    }
+
+    #[test]
+    fn rebased_quantized_mark_time_preserves_pre_in_marks_and_matches_exported_smpte() {
+        let mut track = sample_track();
+        track.in_point_sec = 0.6;
+        let mut settings = ExportSettings::default(); // 25 fps, 01:00:00:00
+        settings.respect_in_out_range = true;
+        settings.rebase_in_point_to_start = true;
+
+        // Pre-In marks (0.0s, 0.5s) must NOT collapse onto in_point_sec (0.6s)
+        let pre0 = settings.quantized_mark_time_sec(0.0, track.in_point_sec);
+        let pre1 = settings.quantized_mark_time_sec(0.5, track.in_point_sec);
+        assert!(pre0 < 0.1, "expected pre-In mark near 0.0s, got {pre0}");
+        assert!((pre1 - 0.5).abs() < 0.05, "expected pre-In mark near 0.5s, got {pre1}");
+
+        // Post-In mark at 1.0s rebases to 0.4s (10 frames after start_timecode)
+        let resolved = resolve_markers(&track, &settings).unwrap();
+        let start_frame = settings.frame_rate.parse_smpte(&settings.start_timecode).unwrap();
+        assert_eq!(resolved.len(), 1);
+        let rm = &resolved[0];
+        let smpte_offset = settings.mark_smpte_offset_sec(rm.time_sec, track.in_point_sec);
+        let disp_frame =
+            start_frame + settings.frame_rate.seconds_to_frames(smpte_offset).max(0) as u64;
+        assert_eq!(disp_frame, rm.frame_index);
     }
 }

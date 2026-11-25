@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use std::fs::File;
 use std::path::Path;
 use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_NULL};
+use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_MP3, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::MediaSourceStream;
@@ -23,7 +23,18 @@ pub struct DecodedAudio {
     pub duration_sec: f64,
 }
 
-/// Decode MP3, WAV, FLAC, OGG, AAC, or M4A into in-memory PCM with gapless LAME/Xing priming trim.
+/// Upper bound for MP3 priming delay restoration (LAME 12-bit delay + decoder delay is <= ~4,624 samples).
+const MAX_MP3_PRIMING_SAMPLES: usize = 16_384;
+
+fn mp3_priming_samples_for_codec(codec: symphonia::core::codecs::CodecType, delay: Option<u32>) -> usize {
+    if codec == CODEC_TYPE_MP3 {
+        (delay.unwrap_or(0) as usize).min(MAX_MP3_PRIMING_SAMPLES)
+    } else {
+        0
+    }
+}
+
+/// Decode MP3, WAV, FLAC, OGG, AAC, or M4A into in-memory PCM aligned with DaVinci Resolve's timeline.
 pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
     let path_ref = path.as_ref();
     let file = File::open(path_ref)
@@ -35,7 +46,10 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
         hint.with_extension(ext);
     }
 
-    // enable_gapless = true honors LAME/Xing/Info encoder delay & padding so MP3 timing aligns with DaVinci Resolve.
+    // Keep enable_gapless = true so Symphonia cleanly skips Xing/Info/VBRI header frames
+    // and respects container edit lists (M4A/MP4/OGG). For MP3, DaVinci Resolve's timeline
+    // MP3 decoder preserves LAME priming delay (~1105 samples ≈ 25ms), so we restore
+    // `codec_params.delay` silent priming samples below so BeatCheck matches Resolve 1:1!
     let format_opts = FormatOptions {
         enable_gapless: true,
         ..Default::default()
@@ -75,8 +89,15 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
         .n_frames
         .map(|n| (n as usize).min(max_prealloc))
         .unwrap_or_else(|| (sample_rate as usize).saturating_mul(180).min(max_prealloc));
-    let mut stereo_pcm = Vec::with_capacity(estimated_frames.saturating_mul(2));
-    let mut mono_pcm = Vec::with_capacity(estimated_frames);
+    let mp3_priming_samples = mp3_priming_samples_for_codec(codec_params.codec, codec_params.delay);
+
+    let prealloc_frames = estimated_frames.saturating_add(mp3_priming_samples);
+    let mut stereo_pcm = Vec::with_capacity(prealloc_frames.saturating_mul(2));
+    let mut mono_pcm = Vec::with_capacity(prealloc_frames);
+    if mp3_priming_samples > 0 {
+        stereo_pcm.resize(mp3_priming_samples.saturating_mul(2), 0.0);
+        mono_pcm.resize(mp3_priming_samples, 0.0);
+    }
     let mut sample_buf: Option<SampleBuffer<f32>> = None;
 
     loop {
@@ -130,7 +151,7 @@ pub fn decode_audio_file<P: AsRef<Path>>(path: P) -> Result<DecodedAudio> {
         }
     }
 
-    if mono_pcm.is_empty() {
+    if mono_pcm.len() <= mp3_priming_samples {
         return Err(anyhow!("Decoded audio file contains zero samples"));
     }
 
@@ -217,4 +238,23 @@ fn lowpass_fir_3tap_or_windowed(input: &[f32], norm_cutoff: f64) -> Vec<f32> {
         out[i] = acc;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use symphonia::core::codecs::{CODEC_TYPE_AAC, CODEC_TYPE_FLAC, CODEC_TYPE_PCM_S16LE};
+
+    #[test]
+    fn mp3_priming_samples_is_capped_and_only_applied_to_mp3() {
+        assert_eq!(mp3_priming_samples_for_codec(CODEC_TYPE_MP3, Some(1105)), 1105);
+        assert_eq!(mp3_priming_samples_for_codec(CODEC_TYPE_MP3, None), 0);
+        assert_eq!(
+            mp3_priming_samples_for_codec(CODEC_TYPE_MP3, Some(u32::MAX)),
+            MAX_MP3_PRIMING_SAMPLES
+        );
+        assert_eq!(mp3_priming_samples_for_codec(CODEC_TYPE_PCM_S16LE, Some(1105)), 0);
+        assert_eq!(mp3_priming_samples_for_codec(CODEC_TYPE_FLAC, Some(1105)), 0);
+        assert_eq!(mp3_priming_samples_for_codec(CODEC_TYPE_AAC, Some(2112)), 0);
+    }
 }

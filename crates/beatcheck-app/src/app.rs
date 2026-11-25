@@ -3,6 +3,9 @@ use crate::config::{PortableConfig, ScrollMode, WaveformVisualMode};
 use crate::export_panel::{draw_slide_over_drawer, DrawerTab, ExportPanelActions};
 use crate::hud::{draw_top_hud, draw_transport_bar, draw_waveform_toolbar, HudActions};
 use crate::launch::{draw_analyzing_screen, draw_split_welcome_screen, LaunchActions};
+use crate::shortcuts::{
+    draw_shortcuts_page, KeyBindings, ShortcutAction, ShortcutsPageActions, ShortcutsPageState,
+};
 use crate::waveform::{draw_main_waveform, draw_mini_overview, WaveformActions, WaveformState};
 use beatcheck_audio::AudioPlayer;
 use beatcheck_core::editing::{self, EditHistory};
@@ -12,11 +15,11 @@ use beatcheck_edl::{
     export_csv, export_cut_list_edl, export_fcpxml, export_json, export_resolve_marker_edl,
     resolve_markers, ExportSettings,
 };
-use egui::{Key, Margin, RichText, Stroke};
+use egui::{Margin, RichText, Stroke};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 enum WorkerMessage {
     Progress(f32, String),
@@ -60,20 +63,35 @@ pub struct BeatCheckApp {
     preview_open: bool,
     preview_text: String,
     status_message: Option<(String, bool)>,
+
+    // Customizable Keyboard Shortcuts & Shortcuts Page
+    shortcuts: KeyBindings,
+    shortcuts_page_open: bool,
+    shortcuts_ui: ShortcutsPageState,
+
+    // Automatic debounced preference persistence (beatcheck.toml)
+    last_saved_config: PortableConfig,
+    pending_save_since: Option<Instant>,
 }
 
 impl BeatCheckApp {
     pub fn new(
         cc: &eframe::CreationContext<'_>,
-        player: AudioPlayer,
+        mut player: AudioPlayer,
         initial_file: Option<PathBuf>,
     ) -> Self {
         brand::configure_brand_theme(&cc.egui_ctx);
 
         let cfg = PortableConfig::load_portable();
+        if let Some(dev_name) = cfg.audio_output_device.clone() {
+            let _ = player.select_output_device(Some(dev_name));
+        }
         player.set_metronome_enabled(cfg.metronome_enabled);
         player.set_music_volume(cfg.music_volume);
         player.set_click_volume(cfg.click_volume);
+        player.set_muted(cfg.muted);
+        player.set_loop_enabled(cfg.loop_enabled);
+        player.set_speed(cfg.playback_speed);
 
         let audio_devices = AudioPlayer::list_output_devices();
         let init_status = player
@@ -96,8 +114,7 @@ impl BeatCheckApp {
             scroll_mode: cfg.scroll_mode,
             main_view_width_px: 980.0,
             recent_files,
-            // Start Resolve Inspector ALWAYS ON from the start of the whole window!
-            drawer_open: true,
+            drawer_open: cfg.drawer_open,
             drawer_tab: DrawerTab::Export,
             worker_rx: None,
             loading_filename: String::new(),
@@ -107,7 +124,13 @@ impl BeatCheckApp {
             preview_open: false,
             preview_text: String::new(),
             status_message: init_status,
+            shortcuts: cfg.shortcuts,
+            shortcuts_page_open: false,
+            shortcuts_ui: ShortcutsPageState::default(),
+            last_saved_config: PortableConfig::default(),
+            pending_save_since: None,
         };
+        app.last_saved_config = app.current_config();
 
         if let Some(path) = initial_file {
             app.start_loading_file(path);
@@ -115,12 +138,65 @@ impl BeatCheckApp {
         app
     }
 
+    fn current_config(&self) -> PortableConfig {
+        PortableConfig {
+            export: self.export.clone(),
+            waveform_mode: self.visual_mode,
+            scroll_mode: self.scroll_mode,
+            metronome_enabled: self.player.metronome_enabled(),
+            music_volume: self.player.music_volume(),
+            click_volume: self.player.click_volume(),
+            muted: self.player.is_muted(),
+            loop_enabled: self.player.loop_enabled(),
+            playback_speed: self.player.speed(),
+            drawer_open: self.drawer_open,
+            audio_output_device: self.player.selected_device_name().map(|s| s.to_string()),
+            recent_files: self.recent_files.clone(),
+            shortcuts: self.shortcuts.clone(),
+        }
+    }
+
+    /// Debounced auto-save: writes `beatcheck.toml` ~400ms after any preference changes
+    /// so dragging sliders doesn't thrash disk, while clicks/toggles persist automatically.
+    fn poll_auto_save_preferences(&mut self, ctx: &egui::Context) {
+        let current = self.current_config();
+        if current == self.last_saved_config {
+            self.pending_save_since = None;
+            return;
+        }
+        let now = Instant::now();
+        match self.pending_save_since {
+            None => {
+                self.pending_save_since = Some(now);
+                ctx.request_repaint_after(Duration::from_millis(450));
+            }
+            Some(since) if now.duration_since(since) >= Duration::from_millis(400) => {
+                if current.save_portable().is_ok() {
+                    self.shortcuts_ui.dirty = false;
+                }
+                // Update snapshot even on read-only media so we don't retry every frame
+                self.last_saved_config = current;
+                self.pending_save_since = None;
+            }
+            Some(_) => {
+                ctx.request_repaint_after(Duration::from_millis(200));
+            }
+        }
+    }
+
     fn visible_marks_for_audio(&self, track: &TrackAnalysis) -> Vec<BeatMark> {
         track
             .marks
             .iter()
             .filter(|m| self.export.style.is_mark_included(m))
-            .cloned()
+            .map(|m| {
+                let mut q = m.clone();
+                q.time_sec = self
+                    .export
+                    .quantized_mark_time_sec(m.time_sec, track.in_point_sec)
+                    .clamp(0.0, track.duration_sec);
+                q
+            })
             .collect()
     }
 
@@ -139,17 +215,37 @@ impl BeatCheckApp {
     }
 
     fn validate_selected_mark(&mut self) {
-        if let Some(sel_id) = self.wf_state.selected_mark_id {
-            let valid = self.track.as_ref().is_some_and(|t| {
-                t.marks
-                    .iter()
-                    .find(|m| m.id == sel_id)
-                    .is_some_and(|m| self.export.style.is_mark_included(m))
-            });
-            if !valid {
-                self.wf_state.selected_mark_id = None;
-            }
+        if self.wf_state.selected_mark_ids.is_empty() {
+            return;
         }
+        if let Some(track) = &self.track {
+            let style = &self.export.style;
+            self.wf_state.selected_mark_ids.retain(|&id| {
+                track
+                    .marks
+                    .iter()
+                    .find(|m| m.id == id)
+                    .is_some_and(|m| style.is_mark_included(m))
+            });
+        } else {
+            self.wf_state.clear_selection();
+        }
+    }
+
+    fn select_all_visible_marks(&mut self) {
+        let Some(track) = &self.track else { return };
+        let style = &self.export.style;
+        self.wf_state.selected_mark_ids = track
+            .marks
+            .iter()
+            .filter(|m| style.is_mark_included(m))
+            .map(|m| m.id)
+            .collect();
+        let count = self.wf_state.selected_count();
+        self.status_message = Some((
+            format!("Selected {count} visible marker{}", if count == 1 { "" } else { "s" }),
+            false,
+        ));
     }
 
     fn ensure_time_visible(&mut self, t: f64) {
@@ -165,6 +261,8 @@ impl BeatCheckApp {
     }
 
     fn start_loading_file(&mut self, path: PathBuf) {
+        self.shortcuts_page_open = false;
+        self.shortcuts_ui.capturing = None;
         self.player.set_playing(false);
         self.loading_filename = path
             .file_name()
@@ -270,27 +368,86 @@ impl BeatCheckApp {
         }
     }
 
+    fn step_playhead_by_frames(&mut self, frames: i32) {
+        let Some(track) = &self.track else { return };
+        let target_sec = crate::config::step_time_by_frames(
+            self.player.position_sec(),
+            frames,
+            self.export.frame_rate,
+            track.duration_sec,
+        );
+        self.player.seek(target_sec);
+        self.ensure_time_visible(target_sec);
+    }
+
     fn nudge_selected_mark_by_frames(&mut self, frames: i32) {
-        let Some(sel_id) = self.wf_state.selected_mark_id else {
+        if self.wf_state.selected_mark_ids.is_empty() {
             return;
-        };
-        let frame_sec = 1.0 / self.export.frame_rate.fps_f64();
+        }
+        let undo_lbl = self.shortcuts.short_label(ShortcutAction::Undo);
         if let Some(track) = self.track.as_mut() {
-            if let Some(cur_t) = track.marks.iter().find(|m| m.id == sel_id).map(|m| m.time_sec) {
+            let selected: Vec<(u64, f64)> = track
+                .marks
+                .iter()
+                .filter(|m| self.wf_state.selected_mark_ids.contains(&m.id))
+                .map(|m| (m.id, m.time_sec))
+                .collect();
+            if selected.is_empty() {
+                self.wf_state.clear_selection();
+                return;
+            }
+            if selected.len() == 1 {
+                let (sel_id, cur_t) = selected[0];
+                let snapped_t = crate::config::step_time_by_frames(
+                    cur_t,
+                    frames,
+                    self.export.frame_rate,
+                    track.duration_sec,
+                );
+                if (snapped_t - cur_t).abs() < 1e-9 {
+                    return;
+                }
                 self.history.push_snapshot(track);
-                let target_frame = (cur_t / frame_sec).round() + frames as f64;
-                let snapped_t = (target_frame * frame_sec).clamp(0.0, track.duration_sec);
                 editing::move_mark(track, sel_id, snapped_t);
+                let smpte_t = self
+                    .export
+                    .mark_smpte_offset_sec(snapped_t, track.in_point_sec);
                 let tc = crate::config::format_live_smpte(
                     self.export.frame_rate,
                     &self.export.start_timecode,
-                    snapped_t,
+                    smpte_t,
                 );
                 self.status_message = Some((
+                    format!("Moved selected mark {:+}f -> {tc}  ({undo_lbl} to undo)", frames),
+                    false,
+                ));
+            } else {
+                let frame_sec = 1.0 / self.export.frame_rate.fps_f64();
+                let raw_delta = frames as f64 * frame_sec;
+                let min_t = selected
+                    .iter()
+                    .map(|&(_, t)| t)
+                    .fold(f64::INFINITY, f64::min);
+                let max_t = selected
+                    .iter()
+                    .map(|&(_, t)| t)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let clamped_delta =
+                    raw_delta.clamp(-min_t, (track.duration_sec - max_t).max(0.0));
+                if clamped_delta.abs() < 1e-9 {
+                    return;
+                }
+                self.history.push_snapshot(track);
+                let updates: Vec<(u64, f64)> = selected
+                    .iter()
+                    .map(|&(id, t)| (id, t + clamped_delta))
+                    .collect();
+                editing::move_marks(track, &updates);
+                self.status_message = Some((
                     format!(
-                        "Moved selected mark {:+}f -> {tc}  ({}+Z to undo)",
-                        frames,
-                        brand::MOD_KEY
+                        "Moved {} selected marks {:+}f  ({undo_lbl} to undo)",
+                        updates.len(),
+                        frames
                     ),
                     false,
                 ));
@@ -301,28 +458,31 @@ impl BeatCheckApp {
 
     fn add_mark_at_playhead(&mut self, kind: MarkKind) {
         let pos = self.player.position_sec();
-        let frame_sec = 1.0 / self.export.frame_rate.fps_f64();
+        let fps = self.export.frame_rate;
         let mut added_tc = None;
         if let Some(track) = self.track.as_mut() {
             self.history.push_snapshot(track);
-            let snapped_t = ((pos / frame_sec).round() * frame_sec).clamp(0.0, track.duration_sec);
+            let snapped_t = crate::config::step_time_by_frames(pos, 0, fps, track.duration_sec);
             let id = editing::add_mark(track, snapped_t, kind);
-            self.wf_state.selected_mark_id = Some(id);
+            self.wf_state.select_single(id);
             // Make sure this beat type is visible so the user immediately sees the mark they added!
             self.export.style.style_for_mut(kind).enabled = true;
+            let smpte_t = self
+                .export
+                .mark_smpte_offset_sec(snapped_t, track.in_point_sec);
             added_tc = Some(crate::config::format_live_smpte(
-                self.export.frame_rate,
+                fps,
                 &self.export.start_timecode,
-                snapped_t,
+                smpte_t,
             ));
         }
         if let Some(tc) = added_tc {
             self.sync_audio_clicks();
             self.status_message = Some((
                 format!(
-                    "Added {} at {tc}  ({}+Z to undo)",
+                    "Added {} at {tc}  ({} to undo)",
                     kind.short_name(),
-                    brand::MOD_KEY
+                    self.shortcuts.short_label(ShortcutAction::Undo)
                 ),
                 false,
             ));
@@ -330,25 +490,58 @@ impl BeatCheckApp {
     }
 
     fn delete_selected_mark(&mut self) {
-        let Some(sel_id) = self.wf_state.selected_mark_id else {
+        if self.wf_state.selected_mark_ids.is_empty() {
             return;
-        };
-        let mut deleted = false;
+        }
+        let mut removed = 0usize;
         if let Some(track) = self.track.as_mut() {
-            if track.marks.iter().any(|m| m.id == sel_id) {
+            let has_any = track
+                .marks
+                .iter()
+                .any(|m| self.wf_state.selected_mark_ids.contains(&m.id));
+            if has_any {
                 self.history.push_snapshot(track);
-                if editing::delete_mark(track, sel_id) {
-                    self.wf_state.selected_mark_id = None;
-                    deleted = true;
-                }
+                removed = editing::delete_marks(track, &self.wf_state.selected_mark_ids);
+            }
+            self.wf_state.clear_selection();
+        }
+        if removed > 0 {
+            self.sync_audio_clicks();
+            let undo_lbl = self.shortcuts.short_label(ShortcutAction::Undo);
+            let msg = if removed == 1 {
+                format!("Deleted selected mark  ({undo_lbl} to undo)")
             } else {
-                self.wf_state.selected_mark_id = None;
+                format!("Deleted {removed} selected marks  ({undo_lbl} to undo)")
+            };
+            self.status_message = Some((msg, false));
+        }
+    }
+
+    fn reclassify_selected_marks(&mut self, kind: MarkKind) {
+        if self.wf_state.selected_mark_ids.is_empty() {
+            return;
+        }
+        let mut changed = 0usize;
+        if let Some(track) = self.track.as_mut() {
+            let has_any = track
+                .marks
+                .iter()
+                .any(|m| self.wf_state.selected_mark_ids.contains(&m.id));
+            if has_any {
+                self.history.push_snapshot(track);
+                changed = editing::reclassify_marks(track, &self.wf_state.selected_mark_ids, kind);
+                self.export.style.style_for_mut(kind).enabled = true;
             }
         }
-        if deleted {
+        if changed > 0 {
             self.sync_audio_clicks();
+            let undo_lbl = self.shortcuts.short_label(ShortcutAction::Undo);
             self.status_message = Some((
-                format!("Deleted selected mark  ({}+Z to undo)", brand::MOD_KEY),
+                format!(
+                    "Set {changed} selected mark{} to {}  ({undo_lbl} to undo)",
+                    if changed == 1 { "" } else { "s" },
+                    kind.short_name()
+                ),
                 false,
             ));
         }
@@ -358,14 +551,14 @@ impl BeatCheckApp {
         if let (Some(orig), Some(track)) = (self.original_track.clone(), self.track.as_mut()) {
             self.history.push_snapshot(track);
             *track = orig;
-            self.wf_state.selected_mark_id = None;
+            self.wf_state.clear_selection();
             self.player
                 .set_loop_range(track.in_point_sec, track.out_point_sec);
             self.sync_audio_clicks();
             self.status_message = Some((
                 format!(
-                    "Reset all edits to original algorithm marks  ({}+Z to undo)",
-                    brand::MOD_KEY
+                    "Reset all edits to original algorithm marks  ({} to undo)",
+                    self.shortcuts.short_label(ShortcutAction::Undo)
                 ),
                 false,
             ));
@@ -373,134 +566,178 @@ impl BeatCheckApp {
     }
 
     fn handle_keyboard_shortcuts(&mut self, ctx: &egui::Context) {
-        if ctx.wants_keyboard_input() {
+        if self.shortcuts_page_open
+            || self.preview_open
+            || ctx.wants_keyboard_input()
+            || ctx.memory(|m| m.any_popup_open())
+        {
             return;
         }
 
+        let kb = &self.shortcuts;
         let (
-            space,
-            key_m,
-            key_l,
-            key_t,
-            key_e,
-            key_esc,
-            key_home,
-            left,
-            right,
-            comma,
-            period,
-            del,
-            ctrl_o,
-            ctrl_z,
-            ctrl_y,
+            play_pause,
+            toggle_metronome,
+            toggle_loop,
+            tap_tempo,
+            toggle_inspector,
+            deselect_mark,
+            rewind_home,
+            step_left,
+            step_right,
+            prev_downbeat,
+            next_downbeat,
+            nudge_back,
+            nudge_fwd,
+            delete_mark,
+            select_all_marks,
+            open_file,
+            undo,
+            redo,
             add_key,
         ) = ctx.input(|i| {
-            let cmd = i.modifiers.ctrl || i.modifiers.command;
-            let no_mods = !cmd && !i.modifiers.alt;
-            let num_mark = if no_mods && i.key_pressed(Key::Num1) {
-                Some(MarkKind::Downbeat)
-            } else if no_mods && i.key_pressed(Key::Num2) {
-                Some(MarkKind::StrongBeat)
-            } else if no_mods && i.key_pressed(Key::Num3) {
+            let mark_key = if kb.is_pressed(ShortcutAction::AddRegularBeat, i) {
                 Some(MarkKind::RegularBeat)
-            } else if no_mods && i.key_pressed(Key::Num4) {
+            } else if kb.is_pressed(ShortcutAction::AddDownbeat, i) {
+                Some(MarkKind::Downbeat)
+            } else if kb.is_pressed(ShortcutAction::AddStrongBeat, i) {
+                Some(MarkKind::StrongBeat)
+            } else if kb.is_pressed(ShortcutAction::AddEnergyDrop, i) {
                 Some(MarkKind::EnergyDrop)
             } else {
                 None
             };
             (
-                no_mods && i.key_pressed(Key::Space),
-                no_mods && i.key_pressed(Key::M),
-                no_mods && i.key_pressed(Key::L),
-                no_mods && i.key_pressed(Key::T),
-                no_mods && i.key_pressed(Key::E),
-                i.key_pressed(Key::Escape),
-                no_mods && i.key_pressed(Key::Home),
-                no_mods && i.key_pressed(Key::ArrowLeft),
-                no_mods && i.key_pressed(Key::ArrowRight),
-                no_mods && (i.key_pressed(Key::Comma) || i.key_pressed(Key::OpenBracket)),
-                no_mods && (i.key_pressed(Key::Period) || i.key_pressed(Key::CloseBracket)),
-                no_mods && (i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)),
-                cmd && i.key_pressed(Key::O),
-                cmd && !i.modifiers.shift && i.key_pressed(Key::Z),
-                cmd && (i.key_pressed(Key::Y) || (i.modifiers.shift && i.key_pressed(Key::Z))),
-                num_mark,
+                kb.is_pressed(ShortcutAction::PlayPause, i),
+                kb.is_pressed(ShortcutAction::ToggleMetronome, i),
+                kb.is_pressed(ShortcutAction::ToggleLoop, i),
+                kb.is_pressed(ShortcutAction::TapTempo, i),
+                kb.is_pressed(ShortcutAction::ToggleInspector, i),
+                kb.is_pressed(ShortcutAction::DeselectMark, i),
+                kb.is_pressed(ShortcutAction::RewindToStart, i),
+                kb.is_pressed(ShortcutAction::StepFrameBack, i),
+                kb.is_pressed(ShortcutAction::StepFrameForward, i),
+                kb.is_pressed(ShortcutAction::PrevDownbeat, i),
+                kb.is_pressed(ShortcutAction::NextDownbeat, i),
+                kb.is_pressed(ShortcutAction::NudgeMarkBack, i),
+                kb.is_pressed(ShortcutAction::NudgeMarkForward, i),
+                kb.is_pressed(ShortcutAction::DeleteSelectedMark, i),
+                kb.is_pressed(ShortcutAction::SelectAllMarks, i),
+                kb.is_pressed(ShortcutAction::OpenFile, i),
+                kb.is_pressed(ShortcutAction::Undo, i),
+                kb.is_pressed(ShortcutAction::Redo, i),
+                mark_key,
             )
         });
 
-        if ctrl_o {
+        if open_file {
             self.open_file_dialog();
         }
-        if key_e {
+        if toggle_inspector {
             self.drawer_open = !self.drawer_open;
         }
-        if key_esc {
-            self.wf_state.selected_mark_id = None;
+        if deselect_mark {
+            self.wf_state.clear_selection();
         }
         if self.track.is_none() || self.worker_rx.is_some() {
             return;
         }
+        if select_all_marks {
+            self.select_all_visible_marks();
+        }
         if let Some(kind) = add_key {
             self.add_mark_at_playhead(kind);
         }
-        if space {
+        if play_pause {
             self.player.toggle_play();
         }
-        if key_m {
+        if toggle_metronome {
             self.player
                 .set_metronome_enabled(!self.player.metronome_enabled());
         }
-        if key_l {
+        if toggle_loop {
             self.player.set_loop_enabled(!self.player.loop_enabled());
         }
-        if key_home {
+        if rewind_home {
             self.player.seek(0.0);
             self.ensure_time_visible(0.0);
         }
-        if comma {
+        if nudge_back {
             self.nudge_selected_mark_by_frames(-1);
         }
-        if period {
+        if nudge_fwd {
             self.nudge_selected_mark_by_frames(1);
         }
-        if left {
+        if step_left {
+            self.step_playhead_by_frames(-1);
+        }
+        if step_right {
+            self.step_playhead_by_frames(1);
+        }
+        if prev_downbeat {
             self.jump_downbeat(-1);
         }
-        if right {
+        if next_downbeat {
             self.jump_downbeat(1);
         }
-        if key_t {
+        if tap_tempo {
             self.handle_tap_tempo();
         }
-        if ctrl_z {
+        if undo {
             self.perform_undo();
         }
-        if ctrl_y {
+        if redo {
             self.perform_redo();
         }
-        if del {
+        if delete_mark {
             self.delete_selected_mark();
+        }
+    }
+
+    fn save_portable_config(&mut self, report_to_shortcuts_notice: bool) {
+        let cfg = self.current_config();
+        match cfg.save_portable() {
+            Ok(path) => {
+                self.last_saved_config = cfg;
+                self.pending_save_since = None;
+                self.shortcuts_ui.dirty = false;
+                let msg = format!("Preferences saved to {}", path.display());
+                if report_to_shortcuts_notice {
+                    self.shortcuts_ui.notice = Some((msg.clone(), false));
+                }
+                self.status_message = Some((msg, false));
+            }
+            Err(err) => {
+                if report_to_shortcuts_notice {
+                    self.shortcuts_ui.notice = Some((err.clone(), true));
+                }
+                self.status_message = Some((err, true));
+            }
         }
     }
 
     fn jump_downbeat(&mut self, dir: i32) {
         let Some(track) = &self.track else { return };
         let pos = self.player.position_sec();
+        let in_pt = track.in_point_sec;
+        let dur = track.duration_sec;
         let target = if dir < 0 {
             track
                 .marks
                 .iter()
-                .filter(|m| m.kind == MarkKind::Downbeat && m.time_sec < pos - 0.15)
+                .filter(|m| m.kind == MarkKind::Downbeat)
+                .map(|m| self.export.quantized_mark_time_sec(m.time_sec, in_pt).clamp(0.0, dur))
+                .filter(|&t| t < pos - 0.15)
                 .next_back()
-                .map(|m| m.time_sec)
                 .unwrap_or(0.0)
         } else {
             track
                 .marks
                 .iter()
-                .find(|m| m.kind == MarkKind::Downbeat && m.time_sec > pos + 0.05)
-                .map(|m| m.time_sec)
-                .unwrap_or(track.duration_sec)
+                .filter(|m| m.kind == MarkKind::Downbeat)
+                .map(|m| self.export.quantized_mark_time_sec(m.time_sec, in_pt).clamp(0.0, dur))
+                .find(|&t| t > pos + 0.05)
+                .unwrap_or(dur)
         };
         self.player.seek(target);
         self.ensure_time_visible(target);
@@ -551,6 +788,7 @@ impl BeatCheckApp {
             }
         }
         if undone {
+            self.wf_state.cancel_active_gestures();
             self.validate_selected_mark();
             self.sync_audio_clicks();
             self.status_message = Some(("Undid last change".into(), false));
@@ -567,6 +805,7 @@ impl BeatCheckApp {
             }
         }
         if redone {
+            self.wf_state.cancel_active_gestures();
             self.validate_selected_mark();
             self.sync_audio_clicks();
             self.status_message = Some(("Redid change".into(), false));
@@ -641,12 +880,24 @@ impl eframe::App for BeatCheckApp {
             .map(|v| v.len())
             .unwrap_or(0);
 
-        let style_before = self.export.style.clone();
+        let export_before = self.export.clone();
 
         let mut hud_actions = HudActions::default();
         let mut wf_actions = WaveformActions::default();
         let mut export_actions = ExportPanelActions::default();
         let mut launch_actions = LaunchActions::default();
+        let mut shortcuts_actions = ShortcutsPageActions::default();
+
+        // On Windows, dragging a window to maximize (Aero Snap) can overhang the left border by ~6-8px;
+        // add a small safe left inset while maximized so no edge button or waveform border clips.
+        #[cfg(target_os = "windows")]
+        let win_max_left_pad: i8 = if ctx.input(|i| i.viewport().maximized == Some(true)) {
+            8
+        } else {
+            0
+        };
+        #[cfg(not(target_os = "windows"))]
+        let win_max_left_pad: i8 = 0;
 
         // 1. Clean Top Brand HUD (overlap-free!)
         egui::TopBottomPanel::top("top_hud_panel")
@@ -654,16 +905,23 @@ impl eframe::App for BeatCheckApp {
                 egui::Frame::new()
                     .fill(brand::PANEL)
                     .stroke(Stroke::new(1.0, brand::BORDER))
-                    .inner_margin(Margin::symmetric(14, 9)),
+                    .inner_margin(Margin {
+                        left: 14 + win_max_left_pad,
+                        right: 14,
+                        top: 9,
+                        bottom: 9,
+                    }),
             )
             .show(ctx, |ui| {
                 draw_top_hud(
                     ui,
                     self.track.as_mut(),
                     &self.export,
+                    &self.shortcuts,
                     playhead_sec,
                     is_playing,
                     self.drawer_open,
+                    self.shortcuts_page_open,
                     resolved_count,
                     &mut hud_actions,
                 );
@@ -676,12 +934,18 @@ impl eframe::App for BeatCheckApp {
                     egui::Frame::new()
                         .fill(brand::PANEL)
                         .stroke(Stroke::new(1.0, brand::BORDER))
-                        .inner_margin(Margin::symmetric(14, 9)),
+                        .inner_margin(Margin {
+                            left: 14 + win_max_left_pad,
+                            right: 14,
+                            top: 9,
+                            bottom: 9,
+                        }),
                 )
                 .show(ctx, |ui| {
                     draw_transport_bar(
                         ui,
                         &self.player,
+                        &self.shortcuts,
                         self.track.is_some(),
                         self.status_message.as_ref(),
                         &mut hud_actions,
@@ -712,12 +976,13 @@ impl eframe::App for BeatCheckApp {
                             &mut self.drawer_tab,
                             &mut self.visual_mode,
                             self.track.as_mut(),
-                            self.wf_state.selected_mark_id,
+                            &self.wf_state.selected_mark_ids,
                             resolved_count,
                             can_reset,
                             &self.player,
                             &self.audio_devices,
                             &mut self.export,
+                            &self.shortcuts,
                             frame_sec,
                             &mut export_actions,
                             &mut hud_actions,
@@ -726,14 +991,30 @@ impl eframe::App for BeatCheckApp {
                 });
         }
 
-        // 4. Center Workspace (Launch Screen | Analyzing Card | Smooth Zero-Shake Waveform)
+        // 4. Center Workspace (Keyboard Shortcuts Page | Launch Screen | Analyzing Card | Waveform)
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::new()
                     .fill(brand::CANVAS)
-                    .inner_margin(Margin::same(12)),
+                    .inner_margin(Margin {
+                        left: 12 + win_max_left_pad,
+                        right: 12,
+                        top: 12,
+                        bottom: 12,
+                    }),
             )
             .show(ctx, |ui| {
+                if self.shortcuts_page_open {
+                    draw_shortcuts_page(
+                        ui,
+                        &mut self.shortcuts,
+                        &mut self.shortcuts_ui,
+                        self.track.is_some(),
+                        &mut shortcuts_actions,
+                    );
+                    return;
+                }
+
                 if self.worker_rx.is_some() {
                     draw_analyzing_screen(
                         ui,
@@ -749,6 +1030,7 @@ impl eframe::App for BeatCheckApp {
                     draw_split_welcome_screen(
                         ui,
                         &self.export,
+                        &self.shortcuts,
                         &self.recent_files,
                         &mut launch_actions,
                     );
@@ -759,7 +1041,8 @@ impl eframe::App for BeatCheckApp {
                     ui,
                     track,
                     &mut self.export,
-                    self.wf_state.selected_mark_id,
+                    &self.shortcuts,
+                    &self.wf_state.selected_mark_ids,
                     &mut self.visual_mode,
                     &mut self.scroll_mode,
                     self.history.can_undo(),
@@ -786,6 +1069,7 @@ impl eframe::App for BeatCheckApp {
                     track,
                     &mut self.wf_state,
                     &self.export,
+                    &self.shortcuts,
                     self.visual_mode,
                     self.scroll_mode,
                     playhead_sec,
@@ -794,8 +1078,8 @@ impl eframe::App for BeatCheckApp {
                 );
             });
 
-        // Sync audio clicks when beat-type filters change
-        if hud_actions.mark_filter_changed || self.export.style != style_before {
+        // Sync audio clicks when beat-type filters, frame rate, or cut offset change
+        if hud_actions.mark_filter_changed || self.export != export_before {
             self.validate_selected_mark();
             self.sync_audio_clicks();
         }
@@ -846,6 +1130,22 @@ impl eframe::App for BeatCheckApp {
         if export_actions.close_drawer {
             self.drawer_open = false;
         }
+        if hud_actions.toggle_shortcuts_page {
+            self.shortcuts_page_open = !self.shortcuts_page_open;
+            self.shortcuts_ui.capturing = None;
+        }
+        if export_actions.open_shortcuts_page || launch_actions.open_shortcuts_page {
+            self.shortcuts_page_open = true;
+            self.shortcuts_ui.capturing = None;
+        }
+        if shortcuts_actions.close_page {
+            self.shortcuts_page_open = false;
+            self.shortcuts_ui.capturing = None;
+        }
+        if shortcuts_actions.bindings_changed {
+            // Auto-save runs right below via poll_auto_save_preferences (flushed on exit too)
+            self.pending_save_since = Some(Instant::now());
+        }
         if let Some(seek_t) = wf_actions.seek_to {
             self.player.seek(seek_t);
         }
@@ -874,8 +1174,14 @@ impl eframe::App for BeatCheckApp {
         if let Some(kind) = hud_actions.add_mark_at_playhead {
             self.add_mark_at_playhead(kind);
         }
+        if let Some(kind) = hud_actions.reclassify_selected_marks {
+            self.reclassify_selected_marks(kind);
+        }
         if hud_actions.delete_selected_mark {
             self.delete_selected_mark();
+        }
+        if hud_actions.clear_selection {
+            self.wf_state.clear_selection();
         }
 
         let mut need_audio_sync = false;
@@ -892,7 +1198,7 @@ impl eframe::App for BeatCheckApp {
                 if (35.0..=260.0).contains(&candidate) {
                     self.history.push_snapshot(track);
                     if editing::toggle_bpm_multiplier(track, mult) {
-                        self.wf_state.selected_mark_id = None;
+                        self.wf_state.clear_selection();
                         wf_actions.marks_mutated = true;
                     }
                 }
@@ -900,26 +1206,26 @@ impl eframe::App for BeatCheckApp {
             if let Some(delta) = hud_actions.shift_downbeat {
                 self.history.push_snapshot(track);
                 editing::shift_downbeat_phase(track, delta);
-                self.wf_state.selected_mark_id = None;
+                self.wf_state.clear_selection();
                 wf_actions.marks_mutated = true;
             }
             if let Some(ts) = hud_actions.set_time_sig {
                 self.history.push_snapshot(track);
                 editing::set_time_signature(track, ts);
-                self.wf_state.selected_mark_id = None;
+                self.wf_state.clear_selection();
                 wf_actions.marks_mutated = true;
             }
             if let Some(mode) = hud_actions.set_grid_mode {
                 self.history.push_snapshot(track);
                 editing::set_grid_mode(track, mode);
-                self.wf_state.selected_mark_id = None;
+                self.wf_state.clear_selection();
                 wf_actions.marks_mutated = true;
             }
             if let Some(extrap) = hud_actions.set_extrapolate {
                 self.history.push_snapshot(track);
                 track.extrapolate_silence = extrap;
                 editing::rebuild_marks_from_raw(track);
-                self.wf_state.selected_mark_id = None;
+                self.wf_state.clear_selection();
                 wf_actions.marks_mutated = true;
             }
             if let Some(new_sens) = hud_actions.set_drop_sensitivity {
@@ -1017,26 +1323,10 @@ impl eframe::App for BeatCheckApp {
             }
         }
         if export_actions.save_portable_config {
-            let cfg = PortableConfig {
-                export: self.export.clone(),
-                waveform_mode: self.visual_mode,
-                scroll_mode: self.scroll_mode,
-                metronome_enabled: self.player.metronome_enabled(),
-                music_volume: self.player.music_volume(),
-                click_volume: self.player.click_volume(),
-                recent_files: self.recent_files.clone(),
-            };
-            match cfg.save_portable() {
-                Ok(path) => {
-                    self.status_message = Some((
-                        format!("Defaults saved to {}", path.display()),
-                        false,
-                    ));
-                }
-                Err(err) => {
-                    self.status_message = Some((err, true));
-                }
-            }
+            self.save_portable_config(false);
+        }
+        if shortcuts_actions.save_portable_config {
+            self.save_portable_config(true);
         }
 
         // Live EDL Preview Modal
@@ -1048,7 +1338,7 @@ impl eframe::App for BeatCheckApp {
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.label(
-                            RichText::new("CMX 3600 Marker EDL · DaVinci Resolve: Timeline -> Import -> Timeline Markers from EDL...")
+                            RichText::new("CMX 3600 Marker EDL · Resolve: Right-click timeline in Media Pool -> Timelines -> Import -> Timeline Markers from EDL...")
                                 .size(12.0)
                                 .color(brand::MUTED),
                         );
@@ -1075,6 +1365,17 @@ impl eframe::App for BeatCheckApp {
                     });
                 });
             self.preview_open = open;
+        }
+
+        // Automatically persist any preference changes (Click, Outline/Solid/RGB, Tape/Page,
+        // Beat Filters, FPS, Volumes, Loop, Speed, Inspector state, Shortcuts, Recent files)
+        self.poll_auto_save_preferences(ctx);
+    }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let current = self.current_config();
+        if current != self.last_saved_config {
+            let _ = current.save_portable();
         }
     }
 }

@@ -17,11 +17,6 @@ pub const MOD_KEY: &str = "Cmd";
 #[cfg(not(target_os = "macos"))]
 pub const MOD_KEY: &str = "Ctrl";
 
-#[cfg(target_os = "macos")]
-pub const REDO_SHORTCUT: &str = "Cmd+Shift+Z";
-#[cfg(not(target_os = "macos"))]
-pub const REDO_SHORTCUT: &str = "Ctrl+Y";
-
 // =============================================================================
 // 02. COLOR PALETTE — Option A: Obsidian & Electric Violet
 // =============================================================================
@@ -278,6 +273,7 @@ pub enum StrokeIcon {
     Check,
     Reset,
     Trash,
+    Keyboard,
 }
 
 pub fn paint_stroke_icon(painter: &egui::Painter, rect: Rect, icon: StrokeIcon, color: Color32) {
@@ -497,6 +493,20 @@ pub fn paint_stroke_icon(painter: &egui::Painter, rect: Rect, icon: StrokeIcon, 
             );
             painter.line_segment([p(0.42, 0.42), p(0.42, 0.68)], st);
             painter.line_segment([p(0.58, 0.42), p(0.58, 0.68)], st);
+        }
+        StrokeIcon::Keyboard => {
+            painter.rect_stroke(
+                Rect::from_min_max(p(0.10, 0.24), p(0.90, 0.76)),
+                2.0,
+                st,
+                StrokeKind::Inside,
+            );
+            // Top key dots
+            for nx in [0.24f32, 0.41, 0.59, 0.76] {
+                painter.line_segment([p(nx - 0.04, 0.42), p(nx + 0.04, 0.42)], st);
+            }
+            // Spacebar
+            painter.line_segment([p(0.30, 0.60), p(0.70, 0.60)], st);
         }
     }
 }

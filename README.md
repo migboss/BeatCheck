@@ -58,7 +58,7 @@ Because BeatCheck is a free, open-source indie app without a paid Apple/Microsof
 2. **Listen & fine-tune visually** — Press **`Space`** to play the song with a synchronized metronome click. Watch the color-coded beat lines light up as they pass the playhead:
    - Click any beat color pill at the top to **hide/show** it, or **Right-click** a pill to **solo** just that beat type (for example, only Beat 1s or only Claps).
    - Drag any marker left or right to snap it cleanly to the exact video frame.
-   - Hit **`1`**, **`2`**, **`3`**, or **`4`** to drop a custom marker right at the playhead — or **Right-click** any point in the waveform after a breakdown/silence and pick **`Re-Lock Grid From Here`**.
+   - Hit **`M`** while playing (or **`1`**, **`2`**, **`3`**, **`4`** for specific beat colors) to drop a custom marker right at the playhead — or **Right-click** any point in the waveform after a breakdown/silence and pick **`Re-Lock Grid From Here`**.
 3. **Export straight into your editor** — Match your timeline **Frame Rate** (e.g. `23.976`, `24`, `25`, `29.97`, `30`, `60 fps`) and **Start Timecode** (`01:00:00:00`) in the right-hand **Timeline Inspector**, then export `.edl`, `.fcpxml`, `.csv`, or `.json` in 1 click.
 
 ---
@@ -69,7 +69,7 @@ BeatCheck exports standard industry formats so you can drop beat markers into al
 
 | Editing Software | Recommended Export | How to Import |
 | :--- | :--- | :--- |
-| **DaVinci Resolve** | **Marker `.edl`** *(existing timeline)*<br>**`.fcpxml`** *(new timeline + audio)* | **`Timeline → Import → Timeline Markers from EDL...`**<br>or **`File → Import → Timeline...`** for `.fcpxml` |
+| **DaVinci Resolve** | **Marker `.edl`** *(existing timeline)*<br>**`.fcpxml`** *(new timeline + audio)* | In the **Media Pool**, **right-click your timeline → `Timelines → Import → Timeline Markers from EDL...`** *(do not use `File → Import → Timeline...` for Marker `.edl`, which creates offline clips)*<br>or **`File → Import → Timeline...`** for **`.fcpxml`** |
 | **Final Cut Pro** | **`.fcpxml`** *(v1.9)* | **`File → Import → XML...`** — imports your audio clip and all beat markers already synced |
 | **Adobe Premiere Pro** | **Cut-List `.edl`** or **`.csv`** | **`File → Import...`** for beat-to-beat cut segments (`.edl`), or import `.csv` via your marker script/panel |
 | **Avid Media Composer** | **Cut-List `.edl`** | Import standard CMX 3600 edit list via List Tool / EDL import |
@@ -105,21 +105,28 @@ Every beat type is color-coded right on the waveform — and you can customize a
 
 ## Keyboard Shortcuts
 
+All keyboard shortcuts below can be customized anytime on the **Keyboard Shortcuts** page (click the keyboard icon in the top bar, or **Settings → Customize Keyboard Shortcuts**) and saved to `beatcheck.toml`.
+
 | Shortcut | Action |
 | :--- | :--- |
 | `Space` | Play / Pause |
-| `M` | Toggle metronome click on/off |
-| `L` | Toggle Loop between In & Out markers |
-| `←` / `→` | Jump to Previous / Next Beat 1 (Downbeat) |
-| `Home` | Rewind to start of track |
+| `M` | Drop a Regular Beat (Blue) marker at the playhead *(works while playing or paused)* |
 | `1` / `2` / `3` / `4` | Drop a Red / Yellow / Blue / Green marker at the playhead |
-| `,` / `.` *(or `[` / `]`)* | Nudge selected marker earlier / later by **1 exact frame** |
-| `Drag Marker` | Snap marker frame-by-frame *(hold `Alt` for free sub-frame placement)* |
+| `←` / `→` | Step playhead backward / forward by **1 exact frame** |
+| `Shift+←` / `Shift+→` *(or `↑` / `↓`)* | Jump to Previous / Next Beat 1 (Downbeat) |
+| `C` | Toggle metronome click on/off |
+| `L` | Toggle Loop between In & Out markers |
+| `Home` | Rewind to start of track |
+| `,` / `.` *(or `[` / `]`)* | Nudge selected marker(s) earlier / later by **1 exact frame** |
+| `Drag Empty Waveform` | Drag-select a box of **visible markers** *(hold `Shift` to add to selection; drag the top ruler to scrub playhead)* |
+| `Shift+Click Marker` | Add or remove an individual marker from the current selection |
+| `Ctrl+A` / `Cmd+A` | Select all currently visible markers |
+| `Drag Marker` | Move selected marker(s) frame-by-frame *(hold `Alt` for free sub-frame placement)* |
 | `Ctrl+Click` / `Cmd+Click` | Insert a marker directly on the waveform *(hold `Shift` for Beat 1)* |
-| `Delete` / `Backspace` | Delete selected marker |
+| `Delete` / `Backspace` | Delete selected marker(s) |
 | `T` | Tap Tempo (tap 3+ times to lock BPM manually) |
 | `E` | Show / Hide Timeline Inspector panel |
-| `Esc` | Deselect current marker |
+| `Esc` | Deselect current marker(s) |
 | `Ctrl+O` / `Cmd+O` | Open audio file |
 | `Ctrl+Z` / `Ctrl+Y` *(or `Cmd+Z` / `Cmd+Shift+Z`)* | Undo / Redo |
 | `Mouse Wheel` | Zoom waveform *(`Shift+Wheel` or Middle-Drag to pan)* |
